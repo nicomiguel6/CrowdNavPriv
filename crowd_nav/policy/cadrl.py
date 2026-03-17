@@ -155,7 +155,7 @@ class CADRL(Policy):
             max_action = None
             for action in self.action_space:
                 next_self_state = self.propagate(state.self_state, action)
-                ob, reward, done, info = self.env.onestep_lookahead(action)
+                ob, reward, _, _, info = self.env.onestep_lookahead(action)
                 batch_next_states = torch.cat([torch.Tensor([next_self_state + next_human_state]).to(self.device)
                                               for next_human_state in ob], dim=0)
                 # VALUE UPDATE

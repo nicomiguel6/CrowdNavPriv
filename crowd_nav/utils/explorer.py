@@ -33,14 +33,15 @@ class Explorer(object):
         collision_cases = []
         timeout_cases = []
         for i in range(k):
-            ob = self.env.reset(phase)
+            ob, _ = self.env.reset(options={"phase": phase})
             done = False
             states = []
             actions = []
             rewards = []
             while not done:
                 action = self.robot.act(ob)
-                ob, reward, done, info = self.env.step(action)
+                ob, reward, terminated, truncated, info = self.env.step(action)
+                done = terminated or truncated
                 states.append(self.robot.policy.last_state)
                 actions.append(action)
                 rewards.append(reward)

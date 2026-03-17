@@ -16,7 +16,7 @@ setup(
     ],
     install_requires=[
         'gitpython',
-        'gym',
+        'gymnasium',
         'matplotlib',
         'numpy',
         'scipy',

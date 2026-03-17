@@ -1,5 +1,7 @@
+import configparser
 import logging
-import gym
+import gymnasium as gym
+from gymnasium import spaces
 import matplotlib.lines as mlines
 import numpy as np
 import rvo2
@@ -13,7 +15,7 @@ from crowd_sim.envs.utils.utils import point_to_segment_dist
 class CrowdSim(gym.Env):
     metadata = {"render.modes": ["human"]}
 
-    def __init__(self):
+    def __init__(self, env_config_file=None, **kwargs):
         """
         Movement simulation for n+1 agents
         Agent can either be human or robot.
@@ -21,6 +23,7 @@ class CrowdSim(gym.Env):
         robot is controlled by a known and learnable policy.
 
         """
+        super().__init__(**kwargs)
         self.time_limit = None
         self.time_step = None
         self.robot = None
@@ -47,6 +50,21 @@ class CrowdSim(gym.Env):
         self.states = None
         self.action_values = None
         self.attention_weights = None
+
+        # gymnasium requires action_space and observation_space.
+        # The actual actions are ActionXY/ActionRot named tuples dispatched by
+        # the policy, so these boxes are intentionally loose placeholders.
+        self.action_space = spaces.Box(
+            low=-np.inf, high=np.inf, shape=(2,), dtype=np.float32
+        )
+        self.observation_space = spaces.Box(
+            low=-np.inf, high=np.inf, shape=(1,), dtype=np.float32
+        )
+
+        if env_config_file is not None:
+            config = configparser.RawConfigParser()
+            config.read(env_config_file)
+            self.configure(config)
 
     def configure(self, config):
         self.config = config
@@ -296,11 +314,18 @@ class CrowdSim(gym.Env):
         del sim
         return self.human_times
 
-    def reset(self, phase="test", test_case=None):
+    def reset(self, *, seed=None, options=None):
         """
         Set px, py, gx, gy, vx, vy, theta for robot and humans
         :return:
         """
+        super().reset(seed=seed)
+        phase = "test"
+        test_case = None
+        if options:
+            phase = options.get("phase", "test")
+            test_case = options.get("test_case", None)
+
         if self.robot is None:
             raise AttributeError("robot has to be set!")
         assert phase in ["train", "val", "test"]
@@ -374,7 +399,7 @@ class CrowdSim(gym.Env):
         elif self.robot.sensor == "RGB":
             raise NotImplementedError
 
-        return ob
+        return ob, {}
 
     def onestep_lookahead(self, action):
         return self.step(action, update=False)
@@ -445,17 +470,19 @@ class CrowdSim(gym.Env):
             < self.robot.radius
         )
 
+        terminated = False
+        truncated = False
         if self.global_time >= self.time_limit - 1:
             reward = 0
-            done = True
+            truncated = True
             info = Timeout()
         elif collision:
             reward = self.collision_penalty
-            done = True
+            terminated = True
             info = Collision()
         elif reaching_goal:
             reward = self.success_reward
-            done = True
+            terminated = True
             info = ReachGoal()
         elif dmin < self.discomfort_dist:
             # only penalize agent for getting too close if it's visible
@@ -465,11 +492,9 @@ class CrowdSim(gym.Env):
                 * self.discomfort_penalty_factor
                 * self.time_step
             )
-            done = False
             info = Danger(dmin)
         else:
             reward = 0
-            done = False
             info = Nothing()
 
         if update:
@@ -509,7 +534,7 @@ class CrowdSim(gym.Env):
             elif self.robot.sensor == "RGB":
                 raise NotImplementedError
 
-        return ob, reward, done, info
+        return ob, reward, terminated, truncated, info
 
     def render(self, mode="human", output_file=None):
         from matplotlib import animation

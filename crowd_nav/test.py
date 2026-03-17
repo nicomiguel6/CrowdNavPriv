@@ -4,17 +4,20 @@ import configparser
 import os
 import torch
 import numpy as np
-import gym
+import gymnasium as gym
 from crowd_nav.utils.explorer import Explorer
 from crowd_nav.policy.policy_factory import policy_factory
 from crowd_sim.envs.utils.robot import Robot
 from crowd_sim.envs.policy.orca import ORCA
 
 
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
 def main():
     parser = argparse.ArgumentParser('Parse configuration file')
-    parser.add_argument('--env_config', type=str, default='configs/env.config')
-    parser.add_argument('--policy_config', type=str, default='configs/policy.config')
+    parser.add_argument('--env_config', type=str, default=os.path.join(_SCRIPT_DIR, 'configs/env.config'))
+    parser.add_argument('--policy_config', type=str, default=os.path.join(_SCRIPT_DIR, 'configs/policy.config'))
     parser.add_argument('--policy', type=str, default='orca')
     parser.add_argument('--model_dir', type=str, default=None)
     parser.add_argument('--il', default=False, action='store_true')
@@ -61,8 +64,7 @@ def main():
     # configure environment
     env_config = configparser.RawConfigParser()
     env_config.read(env_config_file)
-    env = gym.make('CrowdSim-v0')
-    env.configure(env_config)
+    env = gym.make('CrowdSim-v0', env_config_file=env_config_file).unwrapped
     if args.square:
         env.test_sim = 'square_crossing'
     if args.circle:
@@ -87,12 +89,13 @@ def main():
     policy.set_env(env)
     robot.print_info()
     if args.visualize:
-        ob = env.reset(args.phase, args.test_case)
+        ob, _ = env.reset(options={"phase": args.phase, "test_case": args.test_case})
         done = False
         last_pos = np.array(robot.get_position())
         while not done:
             action = robot.act(ob)
-            ob, _, done, info = env.step(action)
+            ob, _, terminated, truncated, info = env.step(action)
+            done = terminated or truncated
             current_pos = np.array(robot.get_position())
             logging.debug('Speed: %.2f', np.linalg.norm(current_pos - last_pos) / robot.time_step)
             last_pos = current_pos
