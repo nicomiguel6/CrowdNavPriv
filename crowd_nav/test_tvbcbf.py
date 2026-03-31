@@ -12,6 +12,7 @@ from crowd_nav.policy.policy_factory import policy_factory
 from crowd_sim.envs.utils.robot import Robot
 from crowd_sim.envs.policy.orca import ORCA
 from crowd_nav.policy.backup_cbf import BackupCBF, Constraint
+from matplotlib import pyplot as plt
 
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -33,7 +34,7 @@ def main():
     parser.add_argument("--model_dir", type=str, default=None)
     parser.add_argument("--il", default=False, action="store_true")
     parser.add_argument("--gpu", default=False, action="store_true")
-    parser.add_argument("--visualize", default=False, action="store_true")
+    parser.add_argument("--visualize", default=True, action="store_true")
     parser.add_argument("--phase", type=str, default="test")
     parser.add_argument("--test_case", type=int, default=None)
     parser.add_argument("--square", default=False, action="store_true")
@@ -102,8 +103,8 @@ def main():
 
     # Set up the time-varying backup CBF
     hs = []
-    human_radius = 0.5
-    human_max_speed = 1.0
+    human_radius = float(env_config.get("humans", "radius"))
+    human_max_speed = float(env_config.get("humans", "v_pref"))
     backup_cbf_constraint = Constraint()
 
     policy.set_phase(args.phase)
@@ -130,7 +131,11 @@ def main():
             done = terminated or truncated
             # Calculate time-varying backup CBF constraint
             hs_value = backup_cbf_constraint.h1_x(
-                robot.get_position(), human_radius, human_max_speed, env.global_time
+                robot.get_position(),
+                env.humans,
+                human_radius,
+                human_max_speed,
+                env.time_step,
             )
             hs.append(hs_value)
             logging.info("Time-varying backup CBF constraint: %f", hs_value)
@@ -153,6 +158,12 @@ def main():
                 "Average time for humans to reach goal: %.2f",
                 sum(human_times) / len(human_times),
             )
+
+        # plot values of hs
+        hs = np.array(hs)
+        plt.plot(hs[:, 0])
+        plt.show()
+
     else:
         explorer.run_k_episodes(
             env.case_size[args.phase], args.phase, print_failure=True

@@ -2,10 +2,12 @@ import numpy as np
 import cvxopt
 from numpy.linalg import norm
 import logging
+from typing import List
+
 from crowd_sim.envs.policy.policy import Policy
 from crowd_sim.envs.utils.action import ActionRot, ActionXY
 from crowd_sim.envs.utils.state import ObservableState, FullState
-
+from crowd_sim.envs.utils.human import Human
 
 # Safety constraint (from DR-bCBF codebase)
 
@@ -26,12 +28,12 @@ class Constraint:
         """
         return 10 * x
 
-    def h1_x(self, x, human_state, human_radius, human_max_speed, backup_time):
+    def h1_x(self, x, humans: List[Human], human_radius, human_max_speed, backup_time):
         """
         Safety constraint.
 
         x: robot state
-        human_state: human state
+        humans: list of human states
         human_radius: human radius
         human_max_speed: human maximum speed
         backup_time: backup time
@@ -42,11 +44,12 @@ class Constraint:
         At each propagated time step, check if the robot is within the reachability set of the human.
 
         """
-        horizontal_distance = (x[0] - human_state.px) ** 2 + (
-            x[1] - human_state.py
-        ) ** 2
-        reachability_distance = (human_radius + human_max_speed * backup_time) ** 2
-        return horizontal_distance - reachability_distance
+        scores = []
+        for human in humans:
+            horizontal_distance = (x[0] - human.px) ** 2 + (x[1] - human.py) ** 2
+            reachability_distance = (human_radius + human_max_speed * backup_time) ** 2
+            scores.append(horizontal_distance - reachability_distance)
+        return scores
 
     def grad_h1(self, x):
         """
