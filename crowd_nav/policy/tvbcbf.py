@@ -18,14 +18,18 @@ import abc
 import logging
 import numpy as np
 from numpy.linalg import norm
+from scipy.integrate import solve_ivp
 
 from crowd_sim.envs.policy.policy import Policy
 from crowd_sim.envs.utils.action import ActionXY, ActionRot
+from crowd_sim.envs.utils.state import FullState
 
+from typing import Optional, List
 
 # ---------------------------------------------------------------------------
 # Backup Maneuver Definitions
 # ---------------------------------------------------------------------------
+
 
 class BackupManeuver(abc.ABC):
     """
@@ -90,39 +94,49 @@ class EvadeManeuver(BackupManeuver):
     """
     Evade maneuver (eq. 31): reposition away from the nearest obstacle
     before stopping.  Direction and speed are configurable.
+
+    Simpler: track to desired x/y lane while holding desired speed forward
     """
 
-    def __init__(self, evade_speed=1.0, evade_direction=None):
+    def __init__(self, evade_direction=None):
         super().__init__(name="evade")
-        self.evade_speed = evade_speed
         self.evade_direction = evade_direction
 
-    def compute_action(self, robot_state, human_states, **kwargs):
-        if self.evade_direction is not None:
-            d = np.array(self.evade_direction, dtype=float)
-            d = d / (norm(d) + 1e-8)
-            return self.evade_speed * d
+    # For now, we want a simpler method that does not depend on the human states
+    def compute_action(self, robot_state, evade_position, **kwargs):
 
-        if len(human_states) == 0:
-            return np.array([0.0, 0.0])
+        # Desired position lane (since we are always moving in the x direction, we want this to be a jump in the y direction)
+        desired_maneuver = np.array([robot_state.vx, evade_position - robot_state.py])
 
-        nearest = min(
-            human_states,
-            key=lambda h: norm([robot_state.px - h.px, robot_state.py - h.py]),
-        )
-        away = np.array([robot_state.px - nearest.px, robot_state.py - nearest.py])
-        d = norm(away)
-        if d < 1e-6:
-            perp = np.array([1.0, 0.0])
-        else:
-            unit = away / d
-            perp = np.array([-unit[1], unit[0]])
-        return self.evade_speed * perp
+        return desired_maneuver
+
+    # def compute_action(self, robot_state, human_states, **kwargs):
+    #     if self.evade_direction is not None:
+    #         d = np.array(self.evade_direction, dtype=float)
+    #         d = d / (norm(d) + 1e-8)
+    #         return self.evade_speed * d
+
+    #     if len(human_states) == 0:
+    #         return np.array([0.0, 0.0])
+
+    #     nearest = min(
+    #         human_states,
+    #         key=lambda h: norm([robot_state.px - h.px, robot_state.py - h.py]),
+    #     )
+    #     away = np.array([robot_state.px - nearest.px, robot_state.py - nearest.py])
+    #     d = norm(away)
+    #     if d < 1e-6:
+    #         perp = np.array([1.0, 0.0])
+    #     else:
+    #         unit = away / d
+    #         perp = np.array([-unit[1], unit[0]])
+    #     return self.evade_speed * perp
 
 
 # ---------------------------------------------------------------------------
 # Backup Controller (uB)
 # ---------------------------------------------------------------------------
+
 
 class BackupController:
     """
@@ -139,18 +153,18 @@ class BackupController:
         if self.mode == "stop":
             return np.array([0.0, 0.0])
 
-        if self.mode == "retreat" and len(human_states) > 0:
-            nearest = min(
-                human_states,
-                key=lambda h: norm([robot_state.px - h.px, robot_state.py - h.py]),
-            )
-            away = np.array([robot_state.px - nearest.px, robot_state.py - nearest.py])
-            d = norm(away)
-            if d < 1e-6:
-                return np.array([0.0, 0.0])
-            direction = away / d
-            v_retreat = min(robot_state.v_pref, self.gain / d)
-            return v_retreat * direction
+        # if self.mode == "retreat" and len(human_states) > 0:
+        #     nearest = min(
+        #         human_states,
+        #         key=lambda h: norm([robot_state.px - h.px, robot_state.py - h.py]),
+        #     )
+        #     away = np.array([robot_state.px - nearest.px, robot_state.py - nearest.py])
+        #     d = norm(away)
+        #     if d < 1e-6:
+        #         return np.array([0.0, 0.0])
+        #     direction = away / d
+        #     v_retreat = min(robot_state.v_pref, self.gain / d)
+        #     return v_retreat * direction
 
         return np.array([0.0, 0.0])
 
@@ -158,6 +172,7 @@ class BackupController:
 # ---------------------------------------------------------------------------
 # Time-Varying Backup Controller  (eq. 9)
 # ---------------------------------------------------------------------------
+
 
 class TimeVaryingBackupController:
     """
@@ -216,6 +231,7 @@ class TimeVaryingBackupController:
 # Safety Primitives (safe set S, backup set S_B)
 # ---------------------------------------------------------------------------
 
+
 class SafetyConstraints:
     """
     Evaluates h(x) >= 0  for safe set S  and  hB(x) >= 0 for backup set S_B.
@@ -258,6 +274,7 @@ class SafetyConstraints:
 # TVBCBF Policy
 # ---------------------------------------------------------------------------
 
+
 class TVBCBF(Policy):
     """
     Time-Varying Backup CBF safety filter.
@@ -284,6 +301,9 @@ class TVBCBF(Policy):
         self.multiagent_training = None
         self.kinematics = "holonomic"
 
+        # integration options
+        self.int_options = {"rtol": 1e-6, "atol": 1e-6}
+
         # Nominal (desired) policy whose actions we filter
         self.nominal_policy = None
 
@@ -299,11 +319,16 @@ class TVBCBF(Policy):
         self.beta = 3.0
 
         # Time horizons
-        self.T = 2.0          # total backup horizon
-        self.dt = 0.25        # discrete time increment (Delta)
+        self.T = 2.0  # total backup horizon
+        self.dt = 0.25  # discrete time increment (Delta)
 
         # Safety primitives
         self.safety = SafetyConstraints()
+
+        # 2-D single-integrator matrices  (state = [px, py], u = [vx, vy])
+        #   ẋ = A x + B u  →  ṗ = v  (velocity is the direct control input)
+        self.A = np.zeros((2, 2), dtype=float)
+        self.B = np.eye(2, dtype=float)
 
     # ------------------------------------------------------------------
     # Configuration & setup
@@ -333,16 +358,22 @@ class TVBCBF(Policy):
         self.tbcs.append(tbc)
         logging.info("TVBCBF: registered TBC %s (index %d)", tbc, len(self.tbcs) - 1)
 
-    def build_default_tbcs(self, backup_mode="stop", backup_gain=1.0,
-                           T_M=0.5, delta=0.2, evade_speed=1.0):
+    def build_default_tbcs(
+        self,
+        maneuvers: Optional[List[BackupManeuver]] = None,
+        backup_mode: str = "stop",
+        backup_gain: float = 1.0,
+        T_M: float = 0.5,
+        delta: float = 0.2,
+    ):
         """Convenience: build and register the standard carry-on + evade pair."""
         backup = BackupController(mode=backup_mode, gain=backup_gain)
-        self.register_tbc(
-            TimeVaryingBackupController(CarryOnManeuver(), backup, T_M, delta)
-        )
-        self.register_tbc(
-            TimeVaryingBackupController(EvadeManeuver(evade_speed), backup, T_M, delta)
-        )
+        if (
+            maneuvers is None
+        ):  # assume just stopping backup controller, defaults to basic backup CBF method
+            maneuvers = [StopManeuver()]
+        for maneuver in maneuvers:
+            self.register_tbc(TimeVaryingBackupController(maneuver, backup, T_M, delta))
 
     # ------------------------------------------------------------------
     # Forwarding hooks to nominal policy
@@ -372,8 +403,10 @@ class TVBCBF(Policy):
             return ActionXY(0, 0) if self.kinematics == "holonomic" else ActionRot(0, 0)
 
         if len(self.tbcs) == 0:
-            raise RuntimeError("TVBCBF: no backup controllers registered. "
-                               "Call register_tbc() or build_default_tbcs() first.")
+            raise RuntimeError(
+                "TVBCBF: no backup controllers registered. "
+                "Call register_tbc() or build_default_tbcs() first."
+            )
 
         robot = state.self_state
         humans = state.human_states
@@ -387,12 +420,21 @@ class TVBCBF(Policy):
             robot, humans, tbc, self.system_time, self.dt, self.tau_0
         )
 
-        # 3) Possibly switch maneuver  (Algorithm 2 — user implements body)
-        self.active_tbc_index, self.tau_0 = self.switch_maneuver(
-            robot, humans, self.tbcs, self.active_tbc_index,
-            self.system_time, self.dt, self.tau_0
-        )
-        tbc = self.tbcs[self.active_tbc_index]
+        # If there is only one maneuver, we don't need to switch
+        if len(self.tbcs) == 1:
+            tbc = self.tbcs[0]
+        else:
+            # 3) Possibly switch maneuver  (Algorithm 2 — user implements body)
+            self.active_tbc_index, self.tau_0 = self.switch_maneuver(
+                robot,
+                humans,
+                self.tbcs,
+                self.active_tbc_index,
+                self.system_time,
+                self.dt,
+                self.tau_0,
+            )
+            tbc = self.tbcs[self.active_tbc_index]
 
         # 4) Compute implicit CBF value  h_I(x)
         h_I = self.compute_implicit_cbf(robot, humans, tbc, self.tau_0)
@@ -416,8 +458,7 @@ class TVBCBF(Policy):
     # Placeholder: Time-offset computation  (Algorithm 1)
     # ------------------------------------------------------------------
 
-    def compute_time_offset(self, robot_state, human_states, tbc,
-                            t, dt, tau_0_prev):
+    def compute_time_offset(self, robot_state, human_states, tbc, t, dt, tau_0_prev):
         """
         Algorithm 1 — Online approximation of tau*_0.
 
@@ -444,15 +485,18 @@ class TVBCBF(Policy):
             else:
                 return tau_0_prev + dt
         """
-        # TODO: implement — propagate flow, check safety along trajectory
+        # Reset candidate: tau_0 = -t gives the full maneuver window
+        if self._tbc_is_feasible(robot_state, human_states, tbc, tau_0=-t):
+            return -t
         return tau_0_prev + dt
 
     # ------------------------------------------------------------------
     # Placeholder: Maneuver switching  (Algorithm 2)
     # ------------------------------------------------------------------
 
-    def switch_maneuver(self, robot_state, human_states, tbcs, current_index,
-                        t, dt, tau_0_prev):
+    def switch_maneuver(
+        self, robot_state, human_states, tbcs, current_index, t, dt, tau_0_prev
+    ):
         """
         Algorithm 2 — Maneuver switching.
 
@@ -484,7 +528,12 @@ class TVBCBF(Policy):
                     return (j, tau_0_prev + dt)
             return (current_index, tau_0_prev)
         """
-        # TODO: implement — check switching condition, try next maneuver
+        tbc = tbcs[current_index]
+        if tau_0_prev >= t - tbc.T_M - dt:
+            j = (current_index + 1) % len(tbcs)
+            if self._tbc_is_feasible(robot_state, human_states, tbcs[j], tau_0=-t):
+                return j, -t
+            return j, tau_0_prev + dt
         return current_index, tau_0_prev
 
     # ------------------------------------------------------------------
@@ -512,54 +561,202 @@ class TVBCBF(Policy):
         -------
         h_I : float — implicit CBF value (>= 0 means safe)
         """
-        # TODO: implement — propagate flow, evaluate h along trajectory
-        h_vals = self.safety.h_safe(robot_state, human_states)
-        if len(h_vals) == 0:
-            return 1.0
-        return float(min(h_vals))
+        traj = self.simulate_flow(robot_state, human_states, tbc, tau_0, self.T)
+
+        h_min = float("inf")
+        for k, row in enumerate(traj):
+            proxy = FullState(
+                px=row[0],
+                py=row[1],
+                vx=row[2],
+                vy=row[3],
+                radius=robot_state.radius,
+                gx=robot_state.gx,
+                gy=robot_state.gy,
+                v_pref=robot_state.v_pref,
+                theta=robot_state.theta,
+            )
+            # Safe-set constraints at every point
+            h_vals = self.safety.h_safe(proxy, human_states)
+            if h_vals:
+                h_min = min(h_min, min(h_vals))
+
+            # Backup-set constraint at the terminal point only
+            if k == len(traj) - 1:
+                h_min = min(h_min, self.safety.h_backup(proxy))
+
+        return h_min if h_min < float("inf") else 1.0
 
     # ------------------------------------------------------------------
-    # Placeholder: Flow simulation
+    # Feasibility check  (shared by Algorithm 1 and Algorithm 2)
     # ------------------------------------------------------------------
 
-    def simulate_flow(self, robot_state, human_states, tbc, tau_0, T, dt):
+    def _tbc_is_feasible(self, robot_state, human_states, tbc, tau_0) -> bool:
         """
-        Simulate the system forward under the time-varying backup
-        controller pi(x, tau - tau_0) for t in [0, T] with step dt.
+        Return True iff the trajectory under `tbc` from `robot_state`:
+          (a) stays entirely inside the safe set S  (h_safe >= 0 at every step), and
+          (b) ends inside the backup set S_B         (h_backup >= 0 at terminal step).
 
-        Returns a list of (position, velocity) tuples representing the
-        propagated trajectory  Phi_pi(x, t, tau_0).
+        This is the feasibility predicate used in both Algorithm 1 and
+        Algorithm 2 of the paper.
+
+        Parameters
+        ----------
+        robot_state  : FullState
+        human_states : list[ObservableState]
+        tbc          : TimeVaryingBackupController
+        tau_0        : float — time-offset to simulate under (typically -t for reset check)
+
+        Returns
+        -------
+        bool
+        """
+        traj = self.simulate_flow(
+            robot_state,
+            human_states,
+            lambda t, x, human_states: tbc.evaluate(t, x, human_states),
+            tau_0,
+            self.T,
+        )
+
+        for k, row in enumerate(traj):
+            proxy = FullState(
+                px=row[0],
+                py=row[1],
+                vx=row[2],
+                vy=row[3],
+                radius=robot_state.radius,
+                gx=robot_state.gx,
+                gy=robot_state.gy,
+                v_pref=robot_state.v_pref,
+                theta=robot_state.theta,
+            )
+            is_terminal = k == len(traj) - 1
+
+            # Every point must be in the safe set
+            if not self.safety.in_safe_set(proxy, human_states):
+                return False
+
+            # Terminal point must also be in the backup set
+            if is_terminal and not self.safety.in_backup_set(proxy):
+                return False
+
+        return True
+
+    # ------------------------------------------------------------------
+    # Dynamics-agnostic ODE helpers  (mirrors dynamics.py structure)
+    # ------------------------------------------------------------------
+
+    def f_x(self, x):
+        """
+        Drift term of the control-affine dynamics  ẋ = f(x) + g(x)u.
+
+        For the 2-D single integrator:  f(x) = A x = [0, 0]  (no drift).
+        """
+        return self.A @ x
+
+    def g_x(self, x):
+        """
+        Input matrix of the control-affine dynamics  ẋ = f(x) + g(x)u.
+
+        For the 2-D single integrator:  g(x) = B = I  (identity, constant).
+        """
+        return self.B
+
+    def _prop_main(self, t, x, u):
+        """
+        ODE right-hand side:  ẋ = f(x) + g(x) u.
+
+        Mirrors Dynamics.propMain from dynamics.py but for the 2-D
+        single-integrator  (ṗ = v,  state = [px, py],  u = [vx, vy]).
+        """
+        return self.f_x(x) + self.g_x(x) @ u
+
+    def integrateState(self, x, u, dt):
+        """
+        Advance position state x by one time step dt under constant
+        velocity command u, using RK45 via solve_ivp.
+
+        Mirrors Dynamics.integrateState from dynamics.py.
+
+        Parameters
+        ----------
+        x  : np.ndarray, shape (2,)  — [px, py]
+        u  : np.ndarray, shape (2,)  — [vx, vy]  (velocity command)
+        dt : float                   — step duration
+
+        Returns
+        -------
+        x_next : np.ndarray, shape (2,)  — [px_next, py_next]
+        """
+        sol = solve_ivp(
+            lambda t, xv: self._prop_main(t, xv, u),
+            (0.0, dt),
+            x,
+            method="RK45",
+            rtol=self.int_options["rtol"],
+            atol=self.int_options["atol"],
+        )
+        return sol.y[:, -1]
+
+    # ------------------------------------------------------------------
+    # Flow simulation
+    # ------------------------------------------------------------------
+
+    def simulate_flow(self, robot_state, human_states, u, tau_0, T) -> np.ndarray:
+        """
+        Simulate the system forward using provided velocity command u for t in [0, T] with step self.dt, using
+        RK45 integration of the 2-D single-integrator dynamics  (ṗ = v).
+
+        If provided u is a single vector, it is assumed to be the velocity command for the entire horizon.
+        If provided u is a list of vectors, it is assumed to be the velocity command at each step.
+        If provided u is a function, it is assumed to be a function of state and time that returns the velocity command.
+        The function should be of the form u(t, x) -> np.ndarray, shape (2,), where t is the time and x is the state of robot and humans.
+
 
         Parameters
         ----------
         robot_state  : FullState — initial state
+        u            : np.ndarray, shape (2,) or list[np.ndarray, shape (2,)] or function  — velocity command
         human_states : list[ObservableState]
-        tbc          : TimeVaryingBackupController
         tau_0        : float — time-offset
         T            : float — horizon
-        dt           : float — step size
 
         Returns
         -------
-        trajectory : list[dict]
-            Each entry has keys 'px', 'py', 'vx', 'vy', 'tau'.
+        trajectory : np.ndarray, shape (n_steps + 1, 5)
+            Each row is [px, py, vx, vy, tau].
+            vx/vy at step i reflect the velocity commanded at step i-1
+            (same semantics as FullState.vx/vy in the rest of the stack).
         """
-        # TODO: implement with actual dynamics integration
         trajectory = []
-        px, py = robot_state.px, robot_state.py
-        vx, vy = robot_state.vx, robot_state.vy
-        n_steps = max(1, int(T / dt))
+        n_steps = max(1, int(round(T / self.dt)))
 
-        for i in range(n_steps + 1):
-            tau = i * dt - tau_0
-            trajectory.append(dict(px=px, py=py, vx=vx, vy=vy, tau=tau))
-            if i < n_steps:
-                action = tbc.evaluate(tau, robot_state, human_states)
-                px += action[0] * dt
-                py += action[1] * dt
-                vx, vy = action[0], action[1]
+        # Position state for the ODE  (single integrator: state = [px, py])
+        x = np.array([robot_state.px, robot_state.py], dtype=float)
 
-        return trajectory
+        # Commanded velocity; initialised from current robot state
+        # u = np.array([robot_state.vx, robot_state.vy], dtype=float)
+
+        if isinstance(u, np.ndarray):
+            u = [u] * n_steps
+        elif isinstance(u, list):
+            assert (
+                len(u) == n_steps
+            ), f"Length of u list must match number of steps: {len(u)} != {n_steps}"
+        elif callable(u):
+            u = [u(i * self.dt, x, human_states) for i in range(n_steps)]
+        else:
+            raise ValueError(
+                f"Invalid type for u: {type(u)}, must be np.ndarray, list of np.ndarrays, or callable"
+            )
+
+        for i in range(n_steps):
+            tau = i * self.dt - tau_0
+            trajectory.append([x[0], x[1], u[i][0], u[i][1], tau])
+            x = self.integrateState(x, u[i], self.dt)
+
+        return np.array(trajectory, dtype=float).reshape(-1, 5)
 
     # ------------------------------------------------------------------
     # Regulation function  (eq. 7-8)  — fully implemented
@@ -623,20 +820,40 @@ class TVBCBF(Policy):
 if __name__ == "__main__":
     from crowd_sim.envs.utils.state import FullState, ObservableState, JointState
 
-    # -- Build a TVBCBF policy with default carry-on + evade TBCs ----------
+    # -- Build maneuvers ----------
+    maneuvers = [EvadeManeuver()]
+
+    # -- Build a TVBCBF policy with default evade TBCs ----------
     policy = TVBCBF()
     policy.kinematics = "holonomic"
     policy.time_step = 0.25
-    policy.build_default_tbcs(backup_mode="stop", T_M=0.5, delta=0.2)
+    policy.build_default_tbcs(
+        maneuvers=maneuvers, backup_mode="stop", T_M=0.5, delta=0.2
+    )
 
     print(f"Policy: {policy.name}")
     print(f"Registered TBCs: {policy.tbcs}")
 
     # -- Fake a robot heading toward a goal with one human nearby ----------
-    robot = FullState(px=0.0, py=0.0, vx=0.5, vy=0.0,
-                      radius=0.3, gx=5.0, gy=0.0, v_pref=1.0, theta=0.0)
-    human = ObservableState(px=2.0, py=0.0, vx=-0.5, vy=0.0, radius=0.3)
+    robot = FullState(
+        px=0.0,
+        py=0.0,
+        vx=0.5,
+        vy=0.0,
+        radius=0.1,
+        gx=10.0,
+        gy=0.0,
+        v_pref=1.0,
+        theta=0.0,
+    )
+    human = ObservableState(px=3.0, py=0.0, vx=0.0, vy=0.0, radius=0.1)
     state = JointState(robot, [human])
+
+    # -- Test tbc feasibility
+    tbc = policy.tbcs[0]
+    print(f"TBC: {tbc}")
+    feasibility = policy._tbc_is_feasible(robot, [human], tbc, tau_0=-2.0)
+    print(f"TBC is feasible: {feasibility}")
 
     # -- Step a few iterations ---------------------------------------------
     n_steps = 8
@@ -646,24 +863,34 @@ if __name__ == "__main__":
     for i in range(n_steps):
         action = policy.predict(state)
         tbc_name = policy.tbcs[policy.active_tbc_index].name
-        print(f"{i:4d}  ({action.vx:+.3f}, {action.vy:+.3f})  "
-              f"{policy.tau_0:+8.3f}  {tbc_name:>10}")
+        print(
+            f"{i:4d}  ({action.vx:+.3f}, {action.vy:+.3f})  "
+            f"{policy.tau_0:+8.3f}  {tbc_name:>10}"
+        )
 
         # Advance the fake robot state with the chosen action
         robot = FullState(
             px=robot.px + action.vx * policy.time_step,
             py=robot.py + action.vy * policy.time_step,
-            vx=action.vx, vy=action.vy,
-            radius=robot.radius, gx=robot.gx, gy=robot.gy,
-            v_pref=robot.v_pref, theta=robot.theta,
+            vx=action.vx,
+            vy=action.vy,
+            radius=robot.radius,
+            gx=robot.gx,
+            gy=robot.gy,
+            v_pref=robot.v_pref,
+            theta=robot.theta,
         )
         # Human walks forward at constant velocity
         human = ObservableState(
             px=human.px + human.vx * policy.time_step,
             py=human.py + human.vy * policy.time_step,
-            vx=human.vx, vy=human.vy, radius=human.radius,
+            vx=human.vx,
+            vy=human.vy,
+            radius=human.radius,
         )
         state = JointState(robot, [human])
 
-    print("\nDone. The placeholders (compute_time_offset, switch_maneuver, "
-          "compute_implicit_cbf)\nreturn defaults — replace them with real logic.")
+    print(
+        "\nDone. The placeholders (compute_time_offset, switch_maneuver, "
+        "compute_implicit_cbf)\nreturn defaults — replace them with real logic."
+    )
