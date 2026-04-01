@@ -3,8 +3,10 @@ from crowd_nav.policy.cadrl import CADRL
 from crowd_nav.policy.lstm_rl import LstmRL
 from crowd_nav.policy.sarl import SARL
 from crowd_nav.policy.orca_blend import OrcaBlend
+from crowd_nav.policy.tvbcbf import TVBCBF
 
 policy_factory['cadrl'] = CADRL
 policy_factory['lstm_rl'] = LstmRL
 policy_factory['sarl'] = SARL
 policy_factory['orca_blend'] = OrcaBlend
+policy_factory['tvbcbf'] = TVBCBF
