@@ -22,7 +22,7 @@ from scipy.integrate import solve_ivp
 
 from crowd_sim.envs.policy.policy import Policy
 from crowd_sim.envs.utils.action import ActionXY, ActionRot
-from crowd_sim.envs.utils.state import FullState
+from crowd_sim.envs.utils.state import FullState, ObservableState
 
 from typing import Optional, List
 
@@ -106,7 +106,7 @@ class EvadeManeuver(BackupManeuver):
     def compute_action(self, robot_state, evade_position, **kwargs):
 
         # Desired position lane (since we are always moving in the x direction, we want this to be a jump in the y direction)
-        desired_maneuver = np.array([robot_state.vx, evade_position - robot_state.py])
+        desired_maneuver = np.array([robot_state.vx, 1.0])
 
         return desired_maneuver
 
@@ -199,12 +199,14 @@ class TimeVaryingBackupController:
     def name(self):
         return self.maneuver.name
 
-    def evaluate(self, tau, robot_state, human_states, **kwargs):
+    def evaluate(self, tau, robot_state, human_states=None, **kwargs):
         """
         Evaluate pi(x, tau) at the given internal clock value tau.
 
         Returns action as np.ndarray of shape (2,).
         """
+        if human_states is None:
+            human_states = []
         u_m = self.maneuver.compute_action(robot_state, human_states, **kwargs)
         u_b = self.backup.compute_action(robot_state, human_states)
 
@@ -415,7 +417,7 @@ class TVBCBF(Policy):
         # 1) Desired action from nominal policy
         u_des = self._get_desired_action(state)
 
-        # 2) Update time-offset  (Algorithm 1 — user implements body)
+        # 2) Update time-offset  (Algorithm 1)
         self.tau_0 = self.compute_time_offset(
             robot, humans, tbc, self.system_time, self.dt, self.tau_0
         )
@@ -486,7 +488,10 @@ class TVBCBF(Policy):
                 return tau_0_prev + dt
         """
         # Reset candidate: tau_0 = -t gives the full maneuver window
-        if self._tbc_is_feasible(robot_state, human_states, tbc, tau_0=-t):
+
+        # 1) Propagate the system state forward using the TBC
+        traj = self.simulate_flow(robot_state, tbc, tau_0=-t, T=self.T)
+        if self._tbc_is_feasible(traj):
             return -t
         return tau_0_prev + dt
 
@@ -591,7 +596,7 @@ class TVBCBF(Policy):
     # Feasibility check  (shared by Algorithm 1 and Algorithm 2)
     # ------------------------------------------------------------------
 
-    def _tbc_is_feasible(self, robot_state, human_states, tbc, tau_0) -> bool:
+    def _tbc_is_feasible(self, traj: np.ndarray) -> bool:
         """
         Return True iff the trajectory under `tbc` from `robot_state`:
           (a) stays entirely inside the safe set S  (h_safe >= 0 at every step), and
@@ -602,44 +607,21 @@ class TVBCBF(Policy):
 
         Parameters
         ----------
-        robot_state  : FullState
-        human_states : list[ObservableState]
-        tbc          : TimeVaryingBackupController
-        tau_0        : float — time-offset to simulate under (typically -t for reset check)
+        traj : np.ndarray, shape (n_steps + 1, n_dims)
 
         Returns
         -------
         bool
         """
-        traj = self.simulate_flow(
-            robot_state,
-            human_states,
-            lambda t, x, human_states: tbc.evaluate(t, x, human_states),
-            tau_0,
-            self.T,
-        )
 
-        for k, row in enumerate(traj):
-            proxy = FullState(
-                px=row[0],
-                py=row[1],
-                vx=row[2],
-                vy=row[3],
-                radius=robot_state.radius,
-                gx=robot_state.gx,
-                gy=robot_state.gy,
-                v_pref=robot_state.v_pref,
-                theta=robot_state.theta,
-            )
-            is_terminal = k == len(traj) - 1
-
-            # Every point must be in the safe set
-            if not self.safety.in_safe_set(proxy, human_states):
+        # For every state in the trajectory, check if it is in the safe set
+        for state in traj:
+            if not self.safety.h_safe(state, []):
                 return False
 
-            # Terminal point must also be in the backup set
-            if is_terminal and not self.safety.in_backup_set(proxy):
-                return False
+        # Check if the terminal state is in the backup set
+        if not self.safety.h_backup(traj[-1]):
+            return False
 
         return True
 
@@ -672,7 +654,14 @@ class TVBCBF(Policy):
         """
         return self.f_x(x) + self.g_x(x) @ u
 
-    def integrateState(self, x, u, dt):
+    def integrateState(
+        self,
+        x: np.ndarray,
+        u: np.ndarray,
+        t_span: np.ndarray,
+        dist: np.ndarray,
+        options: dict,
+    ) -> np.ndarray:
         """
         Advance position state x by one time step dt under constant
         velocity command u, using RK45 via solve_ivp.
@@ -683,19 +672,23 @@ class TVBCBF(Policy):
         ----------
         x  : np.ndarray, shape (2,)  — [px, py]
         u  : np.ndarray, shape (2,)  — [vx, vy]  (velocity command)
-        dt : float                   — step duration
+        t_span : np.ndarray
+        dist : np.ndarray, shape (2,)  — [dx, dy]
+        options : dict
 
         Returns
         -------
         x_next : np.ndarray, shape (2,)  — [px_next, py_next]
         """
+        t_step = (0.0, t_span[-1])
         sol = solve_ivp(
-            lambda t, xv: self._prop_main(t, xv, u),
-            (0.0, dt),
+            lambda t, x: self._prop_main(t, x, u),
+            t_step,
             x,
             method="RK45",
             rtol=self.int_options["rtol"],
             atol=self.int_options["atol"],
+            t_eval=t_span,
         )
         return sol.y[:, -1]
 
@@ -703,60 +696,45 @@ class TVBCBF(Policy):
     # Flow simulation
     # ------------------------------------------------------------------
 
-    def simulate_flow(self, robot_state, human_states, u, tau_0, T) -> np.ndarray:
+    def simulate_flow(
+        self,
+        robot_state: FullState,
+        tbc: TimeVaryingBackupController,
+        tau_0: float,
+        T: float,
+    ) -> np.ndarray:
         """
-        Simulate the system forward using provided velocity command u for t in [0, T] with step self.dt, using
-        RK45 integration of the 2-D single-integrator dynamics  (ṗ = v).
-
-        If provided u is a single vector, it is assumed to be the velocity command for the entire horizon.
-        If provided u is a list of vectors, it is assumed to be the velocity command at each step.
-        If provided u is a function, it is assumed to be a function of state and time that returns the velocity command.
-        The function should be of the form u(t, x) -> np.ndarray, shape (2,), where t is the time and x is the state of robot and humans.
-
+        Simulate system state forward using the time varying backup controller to select an action for the robot and propagate the robot's dynamics forward for t in [0, T] with step self.dt, using
+        RK45 integration of the 4-D single-integrator dynamics  (ṗ = v).
 
         Parameters
         ----------
-        robot_state  : FullState — initial state
-        u            : np.ndarray, shape (2,) or list[np.ndarray, shape (2,)] or function  — velocity command
-        human_states : list[ObservableState]
-        tau_0        : float — time-offset
+        robot_state  : FullState | ObservableState — initial state
+        tbc          : TimeVaryingBackupController — active TBC (pi)
+        tau_0        : float — current time-offset
         T            : float — horizon
 
         Returns
         -------
-        trajectory : np.ndarray, shape (n_steps + 1, 5)
-            Each row is [px, py, vx, vy, tau].
-            vx/vy at step i reflect the velocity commanded at step i-1
-            (same semantics as FullState.vx/vy in the rest of the stack).
+        trajectory : np.ndarray, shape (n_steps + 1, 2)
+            Each row is [px, py, vx, vy].
         """
+
         trajectory = []
-        n_steps = max(1, int(round(T / self.dt)))
+        t_span = np.arange(0, T, self.dt)
 
-        # Position state for the ODE  (single integrator: state = [px, py])
-        x = np.array([robot_state.px, robot_state.py], dtype=float)
+        for t in t_span:
+            # 1) calculate robot action
+            action = tbc.evaluate(tau_0 + t, robot_state, human_states=None)
 
-        # Commanded velocity; initialised from current robot state
-        # u = np.array([robot_state.vx, robot_state.vy], dtype=float)
-
-        if isinstance(u, np.ndarray):
-            u = [u] * n_steps
-        elif isinstance(u, list):
-            assert (
-                len(u) == n_steps
-            ), f"Length of u list must match number of steps: {len(u)} != {n_steps}"
-        elif callable(u):
-            u = [u(i * self.dt, x, human_states) for i in range(n_steps)]
-        else:
-            raise ValueError(
-                f"Invalid type for u: {type(u)}, must be np.ndarray, list of np.ndarrays, or callable"
+            # 2) propagate robot state forward using the action
+            x = np.array([robot_state.px, robot_state.py])
+            new_x = self.integrateState(
+                x, action, t_span, dist=np.array([0.0, 0.0]), options=self.int_options
             )
+            trajectory.append(new_x)
 
-        for i in range(n_steps):
-            tau = i * self.dt - tau_0
-            trajectory.append([x[0], x[1], u[i][0], u[i][1], tau])
-            x = self.integrateState(x, u[i], self.dt)
-
-        return np.array(trajectory, dtype=float).reshape(-1, 5)
+        return np.array(trajectory, dtype=float).reshape(-1, 2)
 
     # ------------------------------------------------------------------
     # Regulation function  (eq. 7-8)  — fully implemented
