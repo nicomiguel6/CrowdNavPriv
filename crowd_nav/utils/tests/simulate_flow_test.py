@@ -57,11 +57,55 @@ if __name__ == "__main__":
     policy.kinematics = "holonomic"
     policy.time_step = 0.25
     policy.build_default_tbcs(
-        maneuvers=[EvadeManeuver()], backup_mode="stop", T_M=0.5, delta=0.2
+        maneuvers=[EvadeManeuver()], backup_mode="stop", T_M=5.0, delta=1.0
     )
     tbc = policy.tbcs[0]
 
-    # print(traj)
+    # Simulate flow
+    traj = policy.simulate_flow(robot, tbc, tau_0=0.0, T=10.0)
 
-    # plt.plot(traj[:, 0], traj[:, 1])
+    # ---------------------------------------------------------------------------
+    # Extract trajectory data
+    # ---------------------------------------------------------------------------
+    xs = np.array([s.px for s in traj])
+    ys = np.array([s.py for s in traj])
+    ts = np.arange(len(traj)) * policy.time_step
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    # --- Plot 1: XY trajectory ---
+    ax1 = axes[0]
+    ax1.plot(xs, ys, "b-o", markersize=3, linewidth=1.5, label="Robot path")
+    ax1.plot(xs[0], ys[0], "gs", markersize=8, label="Start")
+    ax1.plot(xs[-1], ys[-1], "r*", markersize=12, label="End")
+    ax1.plot(robot.gx, robot.gy, "g^", markersize=10, label="Goal")
+    ax1.add_patch(
+        plt.Circle(
+            (human.px, human.py),
+            human.radius,
+            color="orange",
+            alpha=0.5,
+            label="Human",
+        )
+    )
+    ax1.set_xlabel("x (m)")
+    ax1.set_ylabel("y (m)")
+    ax1.set_title("XY Trajectory")
+    ax1.legend()
+    # ax1.set_aspect("equal")
+    ax1.grid(True)
+
+    # --- Plot 2: x and y vs time ---
+    ax2 = axes[1]
+    ax2.plot(ts, xs, "b-", linewidth=1.5, label="x position")
+    ax2.plot(ts, ys, "r--", linewidth=1.5, label="y position")
+    ax2.set_xlabel("Time (s)")
+    ax2.set_ylabel("Position (m)")
+    ax2.set_title("Position vs Time")
+    ax2.legend()
+    ax2.grid(True)
+
+    plt.tight_layout()
+    plt.savefig("simulate_flow_trajectory.png", dpi=150)
     plt.show()
+    print("Plots saved to simulate_flow_trajectory.png")
