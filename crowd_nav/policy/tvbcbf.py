@@ -28,6 +28,7 @@ from crowd_sim.envs.utils.action import ActionXY, ActionRot
 from crowd_sim.envs.utils.state import FullState, ObservableState, JointState
 
 from typing import Optional, List, Tuple
+import tqdm
 
 # ---------------------------------------------------------------------------
 # Backup Maneuver Definitions
@@ -341,6 +342,7 @@ class TVBCBF(Policy):
         # Time-offset state  (Algorithm 1 / 2)
         self.tau_0 = 0.0
         self.system_time = 0.0
+        self.taus = []  # store tau_0 values for each time step for plotting
 
         # Regulation function parameter (eq. 8)
         self.beta = 3.0
@@ -452,6 +454,8 @@ class TVBCBF(Policy):
                 robot_state, human_states, tbc, t, self.dt, self.tau_0
             )
         )
+
+        self.taus.append(self.tau_0)
 
         # Store backup trajectory
         bt_array = []
@@ -962,7 +966,7 @@ class TVBCBF(Policy):
 if __name__ == "__main__":
     from crowd_sim.envs.utils.state import FullState, ObservableState, JointState
 
-    total_time = 20.0
+    total_time = 10.0
 
     # -- Build maneuvers ----------
     maneuvers = [EvadeManeuver()]
@@ -974,8 +978,9 @@ if __name__ == "__main__":
         maneuvers=maneuvers, backup_mode="stop", T_M=1.0, delta=0.5
     )
     policy.T = 5.0
-    policy.dt = 0.05
-    policy.beta = 30000.0
+    desired_frequency = 20.0  # Hz
+    policy.dt = 1.0 / desired_frequency
+    policy.beta = 1000.0
     policy.time_step = policy.dt
     policy.total_time = total_time
 
@@ -1007,7 +1012,7 @@ if __name__ == "__main__":
     trajectory.append(state)
 
     # -- Step a few iterations ---------------------------------------------
-    for i in range(int(total_time / policy.dt)):
+    for i in tqdm.tqdm(range(int(total_time / policy.dt)), desc="Simulating flow"):
         # Current time
         t = i * policy.dt
         # Get the action from the policy
@@ -1048,31 +1053,26 @@ if __name__ == "__main__":
     xs = np.array([s.self_state.px for s in trajectory])
     ys = np.array([s.self_state.py for s in trajectory])
     ts = np.arange(len(trajectory)) * policy.time_step
-
-    fig, axes = plt.subplots(1, 4, figsize=(14, 5))
-
     backup_N = 5
 
     # --- Plot 1: XY trajectory ---
-    ax1 = axes[0]
+    fig1, ax1 = plt.subplots()
     ax1.plot(xs, ys, "b-o", markersize=3, linewidth=1.5, label="Robot path")
     ax1.plot(xs[0], ys[0], "gs", markersize=8, label="Start")
     ax1.plot(xs[-1], ys[-1], "r*", markersize=12, label="End")
     ax1.plot(robot.gx, robot.gy, "g^", markersize=10, label="Goal")
 
-    for i in range(backup_N):
-        if i == 0:
-            label = "Nominal Backup Trajectory"
-        else:
-            label = None
-        ax1.plot(
-            policy.backup_trajectories[i][:, 0],
-            policy.backup_trajectories[i][:, 1],
-            "k-.",
-            linewidth=1.0,
-            alpha=0.5,
-            label=label,
-        )
+    for i in range(len(policy.backup_trajectories)):
+        label = "Nominal Backup Trajectory" if i == 0 else None
+        if i % backup_N == 0:
+            ax1.plot(
+                policy.backup_trajectories[i][:, 0],
+                policy.backup_trajectories[i][:, 1],
+                "k-.",
+                linewidth=1.0,
+                alpha=0.5,
+                label=label,
+            )
 
     ax1.add_patch(
         plt.Circle(
@@ -1090,8 +1090,13 @@ if __name__ == "__main__":
     # ax1.set_aspect("equal")
     ax1.grid(True)
 
+    fig1.savefig("simulate_flow_trajectory.png", dpi=150)
+
+    # ---
+    fig, axes = plt.subplots(1, 4, figsize=(14, 5))
+
     # --- Plot 2: x and y vs time ---
-    ax2 = axes[1]
+    ax2 = axes[0]
     ax2.plot(ts, xs, "b-", linewidth=1.5, label="x position")
     ax2.plot(ts, ys, "r--", linewidth=1.5, label="y position")
     ax2.set_xlabel("Time (s)")
@@ -1101,7 +1106,7 @@ if __name__ == "__main__":
     ax2.grid(True)
 
     # --- Plot 3: lambda vs time ---
-    ax3 = axes[2]
+    ax3 = axes[1]
     ax3.plot(ts[:-1], policy.lambdas, "g--", linewidth=1.5, label="lambda")
     ax3.hlines(1.0, 0, total_time, colors="k", linewidth=1.5, label="Desired Action")
     ax3.hlines(0.0, 0, total_time, colors="r", linewidth=1.5, label="Backup Action")
@@ -1112,14 +1117,23 @@ if __name__ == "__main__":
     ax3.grid(True)
 
     # --- Plot 4: h_I vs time ---
-    ax4 = axes[3]
+    ax4 = axes[2]
     ax4.plot(ts[:-1], policy.h_Is, "b-", linewidth=1.5, label="h_I")
     ax4.set_xlabel("Time (s)")
     ax4.set_ylabel("h_I")
     ax4.set_title("h_I vs Time")
     ax4.legend()
     ax4.grid(True)
-    plt.tight_layout()
-    plt.savefig("simulate_flow_trajectory.png", dpi=150)
-    plt.show()
     print("Plots saved to simulate_flow_trajectory.png")
+
+    # --- Plot 5: tau_0 vs time ---
+    ax5 = axes[3]
+    ax5.plot(ts[:-1], policy.taus, "b-", linewidth=1.5, label="tau_0")
+    ax5.set_xlabel("Time (s)")
+    ax5.set_ylabel("tau_0")
+    ax5.set_title("tau_0 vs Time")
+    ax5.legend()
+    ax5.grid(True)
+    # plt.tight_layout()
+    plt.savefig("simulate_flow_tau_0.png", dpi=150)
+    plt.show()
