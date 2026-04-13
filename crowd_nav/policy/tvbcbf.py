@@ -290,12 +290,17 @@ class SafetyConstraints:
         speed = norm([robot_state.vx, robot_state.vy])
         return self.backup_speed_threshold - speed
 
-    def in_safe_set(self, robot_state: FullState, human_states: List[ObservableState]):
+    def in_safe_set(
+        self,
+        robot_state: FullState,
+        human_states: List[ObservableState],
+        epsilon_t: float = 0.0,
+    ):
         vals = self.h_safe(robot_state, human_states)
-        return all(v >= 0 for v in vals)
+        return all(v >= epsilon_t for v in vals)
 
-    def in_backup_set(self, robot_state: FullState):
-        return self.h_backup(robot_state) >= 0
+    def in_backup_set(self, robot_state: FullState, epsilon_b: float = 0.0):
+        return self.h_backup(robot_state) >= epsilon_b
 
 
 # ---------------------------------------------------------------------------
@@ -446,7 +451,7 @@ class TVBCBF(Policy):
         tbc = self.tbcs[self.active_tbc_index]
 
         # 1) Desired action from nominal policy
-        u_des = self._get_desired_action(robot_state)
+        u_des = self._get_desired_action(state)
 
         # 2) Update time-offset  (Algorithm 1)
         self.tau_0, backup_trajectory, h_safe_vals, h_backup_val = (
@@ -957,6 +962,23 @@ class TVBCBF(Policy):
         for tbc in self.tbcs:
             if isinstance(tbc.maneuver, CarryOnManeuver):
                 tbc.maneuver.held_action = np.array([0.0, 0.0])
+
+
+# ---------------------------------------------------------------------------
+# Robustness Terms
+# ---------------------------------------------------------------------------
+class RobustnessTerms:
+    def __init__(self, policy: TVBCBF):
+        self.policy = policy
+
+        self.Lh_const = []
+        self.Lhb_const = 0.0
+
+    def get_epsilon_t(self):
+        return self.epsilon_t
+
+    def get_epsilon_b(self):
+        return self.epsilon_b
 
 
 # ---------------------------------------------------------------------------
