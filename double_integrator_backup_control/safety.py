@@ -127,7 +127,7 @@ class ASIF(Constraint):
                     # Tightening epsilon
                     epsilon = self.Lh_const * delta_t
 
-                    self.delta_array.append(delta_t)
+                    self.delta_array.append(epsilon)
 
                     if i == rtapoints - 1:
                         # calculate epsilon_b

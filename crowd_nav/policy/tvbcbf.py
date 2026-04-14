@@ -14,6 +14,10 @@ Key concepts:
       and blends desired/backup actions via the regulation function (eq. 7-8).
 """
 
+import sys
+import os
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 import abc
 import logging
 import numpy as np
@@ -125,7 +129,9 @@ class EvadeManeuver(BackupManeuver):
             gains = [1.0, 1.0]
 
         # Desired position lane (since we are always moving in the x direction, we want this to be a jump in the y direction)
-        desired_maneuver = np.array([0.0, gains[1] * (0.5 - robot_state.py)])
+        desired_maneuver = np.array(
+            [0.0, gains[1] * (robot_state.v_pref - robot_state.vy)]
+        )
 
         return ActionAcceleration(desired_maneuver[0], desired_maneuver[1])
 
@@ -373,6 +379,9 @@ class TVBCBF(Policy):
             []
         )  # store projected flow following backup controller for each time step
 
+        # Store actions
+        self.actions = []
+
         # Safety primitives
         self.safety = SafetyConstraints()
 
@@ -500,6 +509,7 @@ class TVBCBF(Policy):
         h_I = self.compute_implicit_cbf(
             backup_trajectory, human_states, h_safe_vals, h_backup_val
         )
+        self.h_Is.append(h_I)
 
         # # Print h_I
         # print("Time: ", t)
@@ -509,6 +519,8 @@ class TVBCBF(Policy):
         # 5) Regulation function  (eq. 7-8)
         u_backup = tbc.evaluate(t - self.tau_0, robot_state, human_states)
         u_act = self.regulation_function(u_des, u_backup, h_I)
+
+        self.actions.append(np.array([u_act.ax, u_act.ay]))
 
         # 6) Latch desired action for carry-on maneuver when tau_0 was reset
         if isinstance(tbc.maneuver, CarryOnManeuver):
@@ -752,14 +764,14 @@ class TVBCBF(Policy):
         """
         return self.B
 
-    def _prop_main(self, t, x, u):
+    def _prop_main(self, t, x, u, dist=np.array([0.0, 0.0, 0.0, 0.0])):
         """
         ODE right-hand side:  ẋ = f(x) + g(x) u.
 
         Mirrors Dynamics.propMain from dynamics.py but for the 2-D
         single-integrator  (ṗ = v,  state = [px, py],  u = [vx, vy]).
         """
-        return self.f_x(x) + self.g_x(x) @ u
+        return self.f_x(x) + self.g_x(x) @ u + dist
 
     def integrateState(
         self,
@@ -805,7 +817,7 @@ class TVBCBF(Policy):
             )
 
         sol = solve_ivp(
-            lambda t, x: self._prop_main(t, x, u),
+            lambda t, x: self._prop_main(t, x, u, dist),
             t_step,
             x,
             method="RK45",
@@ -854,7 +866,7 @@ class TVBCBF(Policy):
             # print(f"t - tau_0: {t - tau_0}")
             action = tbc.evaluate(t - tau_0, robot_state, human_states=None)
 
-            # 2) propagate robot state forward using the action
+            # 2) propagate robot state forward using the action and nominal dynamics
             new_x = self.integrateState(
                 x,
                 action,
@@ -945,7 +957,6 @@ class TVBCBF(Policy):
         u_act = lam * u_des_act + (1.0 - lam) * u_backup_act
 
         self.lambdas.append(lam)
-        self.h_Is.append(h_I)
 
         if isinstance(u_des, ActionXY):
             return ActionXY(u_act[0], u_act[1])
@@ -1001,7 +1012,7 @@ class RobustnessTerms:
     def __init__(self, policy: TVBCBF):
         self.policy = policy
 
-        self.Lh_const = []
+        self.Lh_const = 1.0
         self.Lhb_const = 1.0
 
     def get_epsilon_t(self):
@@ -1033,7 +1044,7 @@ if __name__ == "__main__":
     policy.T = 5.0
     desired_frequency = 20.0  # Hz
     policy.dt = 1.0 / desired_frequency
-    policy.beta = 1000.0
+    policy.beta = 100.0
     policy.time_step = policy.dt
     policy.total_time = total_time
 
@@ -1044,15 +1055,15 @@ if __name__ == "__main__":
     robot = FullState(
         px=0.0,
         py=0.0,
-        vx=5.0,
+        vx=1.0,
         vy=0.0,
         radius=0.1,
-        gx=10.0,
+        gx=15.0,
         gy=0.0,
         v_pref=5.0,
         theta=0.0,
     )
-    human = ObservableState(px=8.0, py=0.0, vx=0.0, vy=0.0, radius=0.1)
+    human = ObservableState(px=7.0, py=0.0, vx=0.0, vy=0.0, radius=0.1)
     state = JointState(robot, [human])
 
     # -- Nominal policy is a simple goal-seeking policy
@@ -1064,12 +1075,18 @@ if __name__ == "__main__":
     trajectory = []
     trajectory.append(state)
 
+    h_vals = []
+    hb_vals = []
+
     # -- Step a few iterations ---------------------------------------------
     for i in tqdm.tqdm(range(int(total_time / policy.dt)), desc="Simulating flow"):
         # Current time
         t = i * policy.dt
         # Get the action from the policy
         action = policy.predict(state, t=t)
+        # Disturbance
+        dist = np.random.uniform(-1.0, 1.0, size=2)
+        dist = np.concatenate([np.array([0.0, 0.0]), dist])
 
         # Propagate robot state forward using the action
         x = np.array([robot.px, robot.py, robot.vx, robot.vy], dtype=float)
@@ -1077,7 +1094,7 @@ if __name__ == "__main__":
             x,
             action,
             t_step=[0, policy.dt],
-            dist=np.array([0.0, 0.0, 0.0, 0.0]),
+            dist=dist,
             options=policy.int_options,
         )
         new_robot_state = FullState(
@@ -1094,6 +1111,12 @@ if __name__ == "__main__":
         robot = new_robot_state
         state = JointState(robot, [human])
         trajectory.append(state)
+
+        # calculate h and hb
+        h = policy.safety.h_safe(robot, [human])
+        hb = policy.safety.h_backup(robot)
+        h_vals.append(h)
+        hb_vals.append(hb)
 
     print(
         "\nDone. The placeholders (compute_time_offset, switch_maneuver, "
@@ -1130,7 +1153,7 @@ if __name__ == "__main__":
     ax1.add_patch(
         plt.Circle(
             (human.px, human.py),
-            human.radius,
+            human.radius + policy.safety.safety_radius + robot.radius,
             color="orange",
             alpha=0.5,
             label="Human",
@@ -1146,7 +1169,7 @@ if __name__ == "__main__":
     fig1.savefig("simulate_flow_trajectory.png", dpi=150)
 
     # ---
-    fig, axes = plt.subplots(1, 4, figsize=(14, 5))
+    fig, axes = plt.subplots(1, 5, figsize=(14, 5))
 
     # --- Plot 2: x and y vs time ---
     ax2 = axes[0]
@@ -1169,12 +1192,13 @@ if __name__ == "__main__":
     ax3.legend()
     ax3.grid(True)
 
-    # --- Plot 4: h_I vs time ---
+    # --- Plot 4: h_I, h vs time ---
     ax4 = axes[2]
-    ax4.plot(ts[:-1], policy.h_Is, "b-", linewidth=1.5, label="h_I")
+    ax4.plot(ts[:-1], h_vals, "b-", linewidth=1.5, label="h")
+    ax4.plot(ts[:-1], policy.h_Is, "g--", linewidth=1.5, label="h_I")
     ax4.set_xlabel("Time (s)")
-    ax4.set_ylabel("h_I")
-    ax4.set_title("h_I vs Time")
+    ax4.set_ylabel("h, h_I")
+    ax4.set_title("h, h_I vs Time")
     ax4.legend()
     ax4.grid(True)
     print("Plots saved to simulate_flow_trajectory.png")
@@ -1188,5 +1212,15 @@ if __name__ == "__main__":
     ax5.legend()
     ax5.grid(True)
     # plt.tight_layout()
+
+    # --- Plot 6: actions vs time ---
+    ax6 = axes[4]
+    ax6.plot(ts[:-1], np.array(policy.actions)[:, 0], "b-", linewidth=1.5, label="ax")
+    ax6.plot(ts[:-1], np.array(policy.actions)[:, 1], "r--", linewidth=1.5, label="ay")
+    ax6.set_xlabel("Time (s)")
+    ax6.set_ylabel("ax, ay")
+    ax6.set_title("Actions vs Time")
+    ax6.legend()
+    ax6.grid(True)
     plt.savefig("simulate_flow_tau_0.png", dpi=150)
     plt.show()
