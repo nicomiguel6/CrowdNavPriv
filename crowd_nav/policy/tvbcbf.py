@@ -23,8 +23,8 @@ from scipy.integrate import solve_ivp
 import matplotlib.pyplot as plt
 
 from crowd_sim.envs.policy.policy import Policy
-from crowd_sim.envs.policy.linear import Linear
-from crowd_sim.envs.utils.action import ActionXY, ActionRot
+from crowd_sim.envs.policy.linear import Linear, LinearAcceleration
+from crowd_sim.envs.utils.action import ActionXY, ActionRot, ActionAcceleration
 from crowd_sim.envs.utils.state import FullState, ObservableState, JointState
 
 from typing import Optional, List, Tuple
@@ -52,7 +52,7 @@ class BackupManeuver(abc.ABC):
     @abc.abstractmethod
     def compute_action(
         self, robot_state, human_states, **kwargs
-    ) -> ActionXY | ActionRot:
+    ) -> ActionXY | ActionRot | ActionAcceleration:
         """
         Return the maneuver action as a numpy array [vx, vy] (holonomic)
         or [v, r] (unicycle).
@@ -76,7 +76,7 @@ class StopManeuver(BackupManeuver):
 
     def compute_action(
         self, robot_state, human_states, **kwargs
-    ) -> ActionXY | ActionRot:
+    ) -> ActionXY | ActionRot | ActionAcceleration:
         u = np.array([0.0, 0.0])
         return ActionXY(u[0], u[1])
 
@@ -97,7 +97,7 @@ class CarryOnManeuver(BackupManeuver):
 
     def compute_action(
         self, robot_state, human_states, **kwargs
-    ) -> ActionXY | ActionRot:
+    ) -> ActionXY | ActionRot | ActionAcceleration:
         return self.held_action.copy()
 
 
@@ -116,12 +116,18 @@ class EvadeManeuver(BackupManeuver):
     # For now, we want a simpler method that does not depend on the human states
     def compute_action(
         self, robot_state, evade_position, **kwargs
-    ) -> ActionXY | ActionRot:
+    ) -> ActionXY | ActionRot | ActionAcceleration:
+
+        # check if kwargs contains gains
+        if "gains" in kwargs:
+            gains = kwargs["gains"]
+        else:
+            gains = [1.0, 1.0]
 
         # Desired position lane (since we are always moving in the x direction, we want this to be a jump in the y direction)
-        desired_maneuver = np.array([robot_state.vx, 0.5])
+        desired_maneuver = np.array([0.0, gains[1] * (0.5 - robot_state.py)])
 
-        return ActionXY(desired_maneuver[0], desired_maneuver[1])
+        return ActionAcceleration(desired_maneuver[0], desired_maneuver[1])
 
     # def compute_action(self, robot_state, human_states, **kwargs):
     #     if self.evade_direction is not None:
@@ -158,16 +164,18 @@ class BackupController:
     stop" or "retreat from nearest obstacle" controller.
     """
 
-    def __init__(self, mode="stop", gain=1.0):
+    def __init__(self, mode: str = "stop", gain: np.ndarray = np.array([1.0, 1.0])):
         self.mode = mode
         self.gain = gain
 
-    def compute_action(self, robot_state, human_states) -> ActionXY | ActionRot:
+    def compute_action(
+        self, robot_state, human_states
+    ) -> ActionXY | ActionRot | ActionAcceleration:
         if self.mode == "stop":
-            u_b = np.array([0.0, 0.0])
-        else:
-            u_b = np.array([0.0, 0.0])
-        return ActionXY(u_b[0], u_b[1])
+            u_b = np.array(
+                [self.gain[0] * (-robot_state.vx), self.gain[1] * (-robot_state.vy)]
+            )
+        return ActionAcceleration(u_b[0], u_b[1])
 
         # if self.mode == "retreat" and len(human_states) > 0:
         #     nearest = min(
@@ -219,7 +227,7 @@ class TimeVaryingBackupController:
         robot_state: FullState,
         human_states: List[ObservableState] = None,
         **kwargs,
-    ) -> ActionXY:
+    ) -> ActionXY | ActionRot | ActionAcceleration:
         """
         Evaluate pi(x, tau) at the given internal clock value tau.
 
@@ -232,19 +240,21 @@ class TimeVaryingBackupController:
 
         if tau <= self.T_M:
             # print("Maneuver")
-            return ActionXY(u_m[0], u_m[1])
+            return ActionAcceleration(u_m[0], u_m[1])
         elif tau <= self.T_M + self.delta:
             alpha = (tau - self.T_M) / self.delta
             # print("Transition")
-            return ActionXY(
+            return ActionAcceleration(
                 (1.0 - alpha) * u_m[0] + alpha * u_b[0],
                 (1.0 - alpha) * u_m[1] + alpha * u_b[1],
             )
         else:
             # print("Backup")
-            return ActionXY(u_b[0], u_b[1])
+            return ActionAcceleration(u_b[0], u_b[1])
 
-    def get_backup_action(self, robot_state, human_states) -> ActionXY | ActionRot:
+    def get_backup_action(
+        self, robot_state, human_states
+    ) -> ActionXY | ActionRot | ActionAcceleration:
         """Direct access to the backup controller action uB(x)."""
         return self.backup.compute_action(robot_state, human_states)
 
@@ -368,8 +378,10 @@ class TVBCBF(Policy):
 
         # 2-D single-integrator matrices  (state = [px, py], u = [vx, vy])
         #   ẋ = A x + B u  →  ṗ = v  (velocity is the direct control input)
-        self.A = np.zeros((2, 2), dtype=float)
-        self.B = np.eye(2, dtype=float)
+        self.A = np.array(
+            [[0, 0, 1, 0], [0, 0, 0, 1], [0, 0, 0, 0], [0, 0, 0, 0]], dtype=float
+        )
+        self.B = np.array([[0, 0], [0, 0], [1, 0], [0, 1]], dtype=float)
 
     # ------------------------------------------------------------------
     # Configuration & setup
@@ -403,7 +415,7 @@ class TVBCBF(Policy):
         self,
         maneuvers: Optional[List[BackupManeuver]] = None,
         backup_mode: str = "stop",
-        backup_gain: float = 1.0,
+        backup_gain: np.ndarray = np.array([1.0, 1.0]),
         T_M: float = 0.5,
         delta: float = 0.2,
     ):
@@ -785,8 +797,12 @@ class TVBCBF(Policy):
             u = np.array(
                 [u.vx, u.vy] if isinstance(u, ActionXY) else [u.v, u.r], dtype=float
             )
+        elif isinstance(u, ActionAcceleration):
+            u = np.array([u.ax, u.ay], dtype=float)
         elif not isinstance(u, np.ndarray):
-            raise ValueError("u must be a ActionXY or ActionRot or numpy array")
+            raise ValueError(
+                "u must be a ActionXY or ActionRot or ActionAcceleration or numpy array"
+            )
 
         sol = solve_ivp(
             lambda t, x: self._prop_main(t, x, u),
@@ -830,7 +846,10 @@ class TVBCBF(Policy):
         t_span = np.arange(0, T, self.dt)
 
         for t in t_span:
-            x = np.array([robot_state.px, robot_state.py], dtype=float)
+            x = np.array(
+                [robot_state.px, robot_state.py, robot_state.vx, robot_state.vy],
+                dtype=float,
+            )
             # 1) calculate robot action
             # print(f"t - tau_0: {t - tau_0}")
             action = tbc.evaluate(t - tau_0, robot_state, human_states=None)
@@ -840,7 +859,7 @@ class TVBCBF(Policy):
                 x,
                 action,
                 t_step=[0, self.dt],
-                dist=np.array([0.0, 0.0]),
+                dist=np.array([0.0, 0.0, 0.0, 0.0]),
                 options=self.int_options,
             )
             x = new_x
@@ -848,8 +867,8 @@ class TVBCBF(Policy):
             new_robot_state = FullState(
                 px=new_x[0],
                 py=new_x[1],
-                vx=action.vx,
-                vy=action.vy,
+                vx=new_x[2],
+                vy=new_x[3],
                 radius=robot_state.radius,
                 gx=robot_state.gx,
                 gy=robot_state.gy,
@@ -893,8 +912,11 @@ class TVBCBF(Policy):
     # ------------------------------------------------------------------
 
     def regulation_function(
-        self, u_des: ActionXY | ActionRot, u_backup: ActionXY | ActionRot, h_I: float
-    ) -> ActionXY | ActionRot:
+        self,
+        u_des: ActionXY | ActionRot | ActionAcceleration,
+        u_backup: ActionXY | ActionRot | ActionAcceleration,
+        h_I: float,
+    ) -> ActionXY | ActionRot | ActionAcceleration:
         """
         Blend desired and backup actions via the regulation function:
 
@@ -910,10 +932,14 @@ class TVBCBF(Policy):
             u_des_act = np.array([u_des.vx, u_des.vy])
         elif isinstance(u_des, ActionRot):
             u_des_act = np.array([u_des.v, u_des.r])
+        elif isinstance(u_des, ActionAcceleration):
+            u_des_act = np.array([u_des.ax, u_des.ay])
         if isinstance(u_backup, ActionXY):
             u_backup_act = np.array([u_backup.vx, u_backup.vy])
         elif isinstance(u_backup, ActionRot):
             u_backup_act = np.array([u_backup.v, u_backup.r])
+        elif isinstance(u_backup, ActionAcceleration):
+            u_backup_act = np.array([u_backup.ax, u_backup.ay])
 
         lam = 1.0 - np.exp(-self.beta * max(0.0, h_I))
         u_act = lam * u_des_act + (1.0 - lam) * u_backup_act
@@ -925,12 +951,14 @@ class TVBCBF(Policy):
             return ActionXY(u_act[0], u_act[1])
         elif isinstance(u_des, ActionRot):
             return ActionRot(u_act[0], u_act[1])
+        elif isinstance(u_des, ActionAcceleration):
+            return ActionAcceleration(u_act[0], u_act[1])
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _get_desired_action(self, state) -> ActionXY | ActionRot:
+    def _get_desired_action(self, state) -> ActionXY | ActionRot | ActionAcceleration:
         """Get action from nominal policy as a numpy array."""
         if self.nominal_policy is not None:
             self.nominal_policy.time_step = self.time_step
@@ -941,6 +969,8 @@ class TVBCBF(Policy):
         if isinstance(action, ActionXY):
             return action
         elif isinstance(action, ActionRot):
+            return action
+        elif isinstance(action, ActionAcceleration):
             return action
         return action
 
@@ -972,9 +1002,10 @@ class RobustnessTerms:
         self.policy = policy
 
         self.Lh_const = []
-        self.Lhb_const = 0.0
+        self.Lhb_const = 1.0
 
     def get_epsilon_t(self):
+
         return self.epsilon_t
 
     def get_epsilon_b(self):
@@ -1021,11 +1052,11 @@ if __name__ == "__main__":
         v_pref=5.0,
         theta=0.0,
     )
-    human = ObservableState(px=5.0, py=0.0, vx=0.0, vy=0.0, radius=0.1)
+    human = ObservableState(px=8.0, py=0.0, vx=0.0, vy=0.0, radius=0.1)
     state = JointState(robot, [human])
 
     # -- Nominal policy is a simple goal-seeking policy
-    policy.set_nominal_policy(Linear())
+    policy.set_nominal_policy(LinearAcceleration())
 
     tbc = policy.tbcs[0]
     print(f"TBC: {tbc}")
@@ -1041,19 +1072,19 @@ if __name__ == "__main__":
         action = policy.predict(state, t=t)
 
         # Propagate robot state forward using the action
-        x = np.array([robot.px, robot.py], dtype=float)
+        x = np.array([robot.px, robot.py, robot.vx, robot.vy], dtype=float)
         new_x = policy.integrateState(
             x,
             action,
             t_step=[0, policy.dt],
-            dist=np.array([0.0, 0.0]),
+            dist=np.array([0.0, 0.0, 0.0, 0.0]),
             options=policy.int_options,
         )
         new_robot_state = FullState(
             px=new_x[0],
             py=new_x[1],
-            vx=action.vx,
-            vy=action.vy,
+            vx=new_x[2],
+            vy=new_x[3],
             radius=robot.radius,
             gx=robot.gx,
             gy=robot.gy,

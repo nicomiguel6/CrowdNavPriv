@@ -1,4 +1,6 @@
 from collections import namedtuple
 
-ActionXY = namedtuple('ActionXY', ['vx', 'vy'])
-ActionRot = namedtuple('ActionRot', ['v', 'r'])
+ActionXY = namedtuple("ActionXY", ["vx", "vy"])
+ActionRot = namedtuple("ActionRot", ["v", "r"])
+
+ActionAcceleration = namedtuple("ActionAcceleration", ["ax", "ay"])
