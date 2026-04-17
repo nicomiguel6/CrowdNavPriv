@@ -54,9 +54,9 @@ class LinearAcceleration(Policy):
         ax = (vx - self_state.vx) / self.time_step
         ay = (vy - self_state.vy) / self.time_step
 
-        # saturate the acceleration
-        ax = np.clip(ax, -0.1, 0.1)
-        ay = np.clip(ay, -0.1, 0.1)
+        # # saturate the acceleration
+        # ax = np.clip(ax, -0.1, 0.1)
+        # ay = np.clip(ay, -0.1, 0.1)
 
         return ActionAcceleration(ax, ay)
 
@@ -77,5 +77,7 @@ class GoStraight(Policy):
         vy = 0
 
         ax = (vx - self_state.vx) / self.time_step
+
+        # ax = np.clip(ax, -1.0, 1.0)
 
         return ActionAcceleration(ax, 0)

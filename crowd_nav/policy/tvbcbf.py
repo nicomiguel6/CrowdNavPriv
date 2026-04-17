@@ -126,36 +126,20 @@ class EvadeManeuver(BackupManeuver):
         if "gains" in kwargs:
             gains = kwargs["gains"]
         else:
-            gains = [1.0, 1.0]
+            gains = [10.0, 10.0]
 
         # Desired position lane (since we are always moving in the x direction, we want this to be a jump in the y direction)
+        # desired_maneuver = np.array(
+        #     [0.0, gains[1] * (robot_state.v_pref - robot_state.vy)]
+        # )
         desired_maneuver = np.array(
-            [0.0, gains[1] * (robot_state.v_pref - robot_state.vy)]
-        )
+            [0.0, gains[1] * 1.0]
+        )  # constant acceleration in the y direction
+
+        # Saturate the acceleration
+        desired_maneuver = np.clip(desired_maneuver, -1.0, 1.0)
 
         return ActionAcceleration(desired_maneuver[0], desired_maneuver[1])
-
-    # def compute_action(self, robot_state, human_states, **kwargs):
-    #     if self.evade_direction is not None:
-    #         d = np.array(self.evade_direction, dtype=float)
-    #         d = d / (norm(d) + 1e-8)
-    #         return self.evade_speed * d
-
-    #     if len(human_states) == 0:
-    #         return np.array([0.0, 0.0])
-
-    #     nearest = min(
-    #         human_states,
-    #         key=lambda h: norm([robot_state.px - h.px, robot_state.py - h.py]),
-    #     )
-    #     away = np.array([robot_state.px - nearest.px, robot_state.py - nearest.py])
-    #     d = norm(away)
-    #     if d < 1e-6:
-    #         perp = np.array([1.0, 0.0])
-    #     else:
-    #         unit = away / d
-    #         perp = np.array([-unit[1], unit[0]])
-    #     return self.evade_speed * perp
 
 
 # ---------------------------------------------------------------------------
@@ -170,7 +154,7 @@ class BackupController:
     stop" or "retreat from nearest obstacle" controller.
     """
 
-    def __init__(self, mode: str = "stop", gain: np.ndarray = np.array([1.0, 1.0])):
+    def __init__(self, mode: str = "stop", gain: np.ndarray = np.array([10.0, 10.0])):
         self.mode = mode
         self.gain = gain
 
@@ -205,9 +189,9 @@ class BackupController:
 class TimeVaryingBackupController:
     """
     Composite policy pi(x, tau) that sequences:
-        tau <= T_M          :  maneuver uM(x)
-        T_M < tau <= T_M+d  :  smooth transition uM->B(x, tau)
-        tau > T_M+d         :  backup controller uB(x)
+        relative_time <= T_M          :  maneuver uM(x)
+        T_M < relative_time <= T_M+d  :  smooth transition uM->B(x, relative_time)
+        relative_time > T_M+d         :  backup controller uB(x)
 
     Parameters
     ----------
@@ -229,13 +213,13 @@ class TimeVaryingBackupController:
 
     def evaluate(
         self,
-        tau: float,
+        relative_time: float,
         robot_state: FullState,
         human_states: List[ObservableState] = None,
         **kwargs,
     ) -> ActionXY | ActionRot | ActionAcceleration:
         """
-        Evaluate pi(x, tau) at the given internal clock value tau.
+        Evaluate pi(x, relative_time) at the given relative time.
 
         Returns action as np.ndarray of shape (2,).
         """
@@ -244,11 +228,11 @@ class TimeVaryingBackupController:
         u_m = self.maneuver.compute_action(robot_state, human_states, **kwargs)
         u_b = self.backup.compute_action(robot_state, human_states)
 
-        if tau <= self.T_M:
+        if relative_time <= self.T_M:
             # print("Maneuver")
             return ActionAcceleration(u_m[0], u_m[1])
-        elif tau <= self.T_M + self.delta:
-            alpha = (tau - self.T_M) / self.delta
+        elif relative_time <= self.T_M + self.delta:
+            alpha = (relative_time - self.T_M) / self.delta
             # print("Transition")
             return ActionAcceleration(
                 (1.0 - alpha) * u_m[0] + alpha * u_b[0],
@@ -349,7 +333,7 @@ class TVBCBF(Policy):
         self.trainable = False
         self.multiagent_training = None
         self.kinematics = "holonomic"
-
+        self.debug = False
         # integration options
         self.int_options = {"rtol": 1e-6, "atol": 1e-6}
 
@@ -361,14 +345,20 @@ class TVBCBF(Policy):
         self.active_tbc_index = 0
 
         # Time-offset state  (Algorithm 1 / 2)
-        self.tau_0 = 0.0
+        self.delta_tau = 0.1
         self.system_time = 0.0
-        self.taus = []  # store tau_0 values for each time step for plotting
+        self.tau_0 = 0.0
+        self.relative_time = 0.0
+        self.system_times = []
+        self.tau_0s = []  # store tau_0 values for each time step for plotting
+        self.relative_times = []
 
         # Regulation function parameter (eq. 8)
         self.beta = 3.0
         self.lambdas = []  # lambda values for each time step for plotting
         self.h_Is = []  # h_I values for each time step for plotting
+        self.h_safe_mins = []  # min h_safe across horizon + humans, per step
+        self.h_backups = []  # h_backup at terminal backup state, per step
 
         # Time horizons
         self.T = 2.0  # total backup horizon
@@ -405,6 +395,7 @@ class TVBCBF(Policy):
             self.safety.backup_speed_threshold = config.getfloat(
                 "tvbcbf", "backup_speed_threshold"
             )
+            self.debug = config.getboolean("tvbcbf", "debug")
 
         if config.has_section("action_space"):
             self.kinematics = config.get("action_space", "kinematics")
@@ -460,7 +451,7 @@ class TVBCBF(Policy):
     # Core predict loop
     # ------------------------------------------------------------------
 
-    def predict(self, state: JointState, t: float = None):
+    def predict(self, state: JointState):
         if len(self.tbcs) == 0:
             raise RuntimeError(
                 "TVBCBF: no backup controllers registered. "
@@ -477,17 +468,27 @@ class TVBCBF(Policy):
         # 2) Update time-offset  (Algorithm 1)
         self.tau_0, backup_trajectory, h_safe_vals, h_backup_val = (
             self.compute_time_offset(
-                robot_state, human_states, tbc, t, self.dt, self.tau_0
+                robot_state=robot_state,
+                human_states=human_states,
+                system_time=self.system_time,
+                tau_0_prev=self.tau_0,
+                tbc=tbc,
+                dt=self.dt,
             )
         )
-
-        self.taus.append(self.tau_0)
 
         # Store backup trajectory
         bt_array = []
         for bt in backup_trajectory:
             bt_array.append(np.array([bt.px, bt.py]))
-        self.backup_trajectories.append(np.array(bt_array))
+        self.backup_trajectories.append(np.array(bt_array))  # store for plotting
+
+        # We define self.system_time as the absolute time since the start of the simulation
+        # We define self.tau_0 as the current offset-time value (Starts at 0.0)
+        # We define self.relative_time as the relative time since the start of the maneuver (self.system_time - self.tau_0)
+        self.tau_0s.append(self.tau_0)
+        self.system_times.append(self.system_time)
+        self.relative_times.append(self.system_time - self.tau_0)
 
         # If there is only one maneuver, we don't need to switch
         if len(self.tbcs) == 1:
@@ -499,7 +500,6 @@ class TVBCBF(Policy):
                 human_states,
                 self.tbcs,
                 self.active_tbc_index,
-                self.system_time,
                 self.dt,
                 self.tau_0,
             )
@@ -510,14 +510,19 @@ class TVBCBF(Policy):
             backup_trajectory, human_states, h_safe_vals, h_backup_val
         )
         self.h_Is.append(h_I)
+        self.h_safe_mins.append(min(min(vals) for vals in h_safe_vals))
+        self.h_backups.append(float(np.min(h_backup_val)))
 
-        # # Print h_I
-        # print("Time: ", t)
-        # print("Relative Time: ", t - self.tau_0)
-        # print("h_I: ", h_I)
+        # FOR DEBUGGING: plot backup trajectory and CBF values
+        if self.debug:
+            self._debug_plot(
+                backup_trajectory, human_states, h_safe_vals, h_backup_val, h_I
+            )
 
         # 5) Regulation function  (eq. 7-8)
-        u_backup = tbc.evaluate(t - self.tau_0, robot_state, human_states)
+        u_backup = tbc.evaluate(
+            self.system_time - self.tau_0, robot_state, human_states
+        )
         u_act = self.regulation_function(u_des, u_backup, h_I)
 
         self.actions.append(np.array([u_act.ax, u_act.ay]))
@@ -541,10 +546,10 @@ class TVBCBF(Policy):
         self,
         robot_state: FullState,
         human_states: List[ObservableState],
-        tbc: TimeVaryingBackupController,
-        t: float,
-        dt: float,
+        system_time: float,
         tau_0_prev: float,
+        tbc: TimeVaryingBackupController,
+        dt: float,
     ) -> Tuple[float, List[FullState], List[float], float]:
         """
         Algorithm 1 — Online approximation of tau*_0.
@@ -556,10 +561,11 @@ class TVBCBF(Policy):
         ----------
         robot_state  : FullState — current robot state x
         human_states : List[ObservableState] — observable humans
-        tbc          : TimeVaryingBackupController — active TBC (pi)
-        t            : float — current system time
-        dt           : float — discrete time increment (Delta)
+        system_time  : float — current system time
         tau_0_prev   : float — previous tau*_0 solution
+        relative_time: float — current relative time
+        tbc          : TimeVaryingBackupController — active TBC (pi)
+        dt           : float — discrete time increment (Delta)
 
         Returns
         -------
@@ -573,22 +579,64 @@ class TVBCBF(Policy):
             else:
                 return tau_0_prev + dt
         """
-        # Reset candidate: tau_0 = -t gives the full maneuver window
+        # INPUT --------------------------------------------------------------
+        # Get the candidate time offset
+        tau_0 = system_time  # - dt  # + self.delta_tau
 
+        # OUTPUT -------------------------------------------------------------
         # Propagate the system state forward using the TBC
-        traj = self.simulate_flow(robot_state, tbc, tau_0=-t, T=self.T)
+        traj = self.simulate_flow(
+            robot_state=robot_state,
+            tbc=tbc,
+            system_time=system_time,
+            tau_0=tau_0,
+            T=self.T,
+            human_state=human_states[0],
+        )
         safe_bool, h_safe_vals, h_backup_val = self._tbc_is_feasible(traj, human_states)
         if safe_bool:
-            return -t, traj, h_safe_vals, h_backup_val
-        return tau_0_prev + dt, traj, h_safe_vals, h_backup_val
+            h_min = np.min([val for val in h_safe_vals])
+            h_backup_val_min = np.min(h_backup_val)
+            h_I = min(h_min, h_backup_val_min)
+            # print("h_min: ", h_min)
+            # print("h_backup_val_min: ", h_backup_val_min)
+            # print("h_I: ", h_I)
+            return tau_0, traj, h_safe_vals, h_backup_val
+        else:
+            # Decrement the candidate time offset
+            tau_0 = tau_0_prev - self.dt
+            new_traj = self.simulate_flow(
+                robot_state=robot_state,
+                tbc=tbc,
+                system_time=system_time,
+                tau_0=tau_0,
+                T=self.T,
+                human_state=human_states[0],
+            )
+            safe_bool, h_safe_vals, h_backup_val = self._tbc_is_feasible(
+                new_traj, human_states
+            )
+            h_min = np.min([val for val in h_safe_vals])
+            h_backup_val_min = np.min(h_backup_val)
+            h_I = min(h_min, h_backup_val_min)
+            # print("h_min: ", h_min)
+            # print("h_backup_val_min: ", h_backup_val_min)
+            # print("h_I: ", h_I)
+            return tau_0, new_traj, h_safe_vals, h_backup_val
 
     # ------------------------------------------------------------------
     # Placeholder: Maneuver switching  (Algorithm 2)
     # ------------------------------------------------------------------
 
     def switch_maneuver(
-        self, robot_state, human_states, tbcs, current_index, t, dt, tau_0_prev
-    ):
+        self,
+        robot_state,
+        human_states,
+        tbcs,
+        current_index,
+        dt,
+        tau_0_prev,
+    ) -> Tuple[int, float]:
         """
         Algorithm 2 — Maneuver switching.
 
@@ -602,7 +650,7 @@ class TVBCBF(Policy):
         human_states : list[ObservableState]
         tbcs         : list[TimeVaryingBackupController]
         current_index: int — index of the currently active TBC
-        t            : float — system time
+        actual_time  : float — current actual time
         dt           : float — discrete time increment
         tau_0_prev   : float — previous tau*_0
 
@@ -621,10 +669,12 @@ class TVBCBF(Policy):
             return (current_index, tau_0_prev)
         """
         tbc = tbcs[current_index]
-        if tau_0_prev >= t - tbc.T_M - dt:
+        if tau_0_prev >= self.system_time - tbc.T_M - dt:
             j = (current_index + 1) % len(tbcs)
-            if self._tbc_is_feasible(robot_state, human_states, tbcs[j], tau_0=-t):
-                return j, -t
+            if self._tbc_is_feasible(
+                robot_state, human_states, tbcs[j], tau_0=-self.system_time
+            ):
+                return j, -self.system_time
             return j, tau_0_prev + dt
         return current_index, tau_0_prev
 
@@ -660,10 +710,9 @@ class TVBCBF(Policy):
         h_I : float — implicit CBF value (>= 0 means safe)
         """
 
-        h_vals_min = np.min(h_vals)
-        h_backup_val_min = np.min(h_backup_val)
+        h_vals_min = np.min([val for val in h_vals])
 
-        h_I = min(h_vals_min, h_backup_val_min)
+        h_I = min(h_vals_min, h_backup_val)
 
         return h_I
 
@@ -709,29 +758,6 @@ class TVBCBF(Policy):
             h_safe_vals.append(self.safety.h_safe(state, human_states))
 
         h_backup_val = self.safety.h_backup(traj[-1])
-
-        # # FOR DEBUGGING: PLOT H_SAFE_VALS AND H_BACKUP_VAL
-        # tmp_vals = np.array(
-        #     [
-        #         h_safe_vals[i][j]
-        #         for i in range(len(h_safe_vals))
-        #         for j in range(len(h_safe_vals[i]))
-        #     ]
-        # )
-        # plt.plot(tmp_vals, "b-", linewidth=1.5, label="h_safe_vals")
-        # plt.plot(
-        #     self.T / self.dt,
-        #     h_backup_val,
-        #     "ro",
-        #     markersize=10,
-        #     label="h_backup_val",
-        # )
-        # plt.legend()
-        # plt.xlabel("Time (s)")
-        # plt.ylabel("Value")
-        # plt.title("h_safe_vals and h_backup_val")
-        # plt.grid(True)
-        # plt.show()
 
         # check if any of the h_safe_vals are less than epsilon_tau
         for h_safe_val in h_safe_vals:
@@ -835,8 +861,10 @@ class TVBCBF(Policy):
         self,
         robot_state: FullState,
         tbc: TimeVaryingBackupController,
+        system_time: float,
         tau_0: float,
         T: float,
+        human_state: Optional[ObservableState] = None,
     ) -> np.ndarray:
         """
         Simulate system state forward using the time varying backup controller to select an action for the robot and propagate the robot's dynamics forward for t in [0, T] with step self.dt, using
@@ -846,16 +874,17 @@ class TVBCBF(Policy):
         ----------
         robot_state  : FullState | ObservableState — initial state
         tbc          : TimeVaryingBackupController — active TBC (pi)
-        tau_0        : float — current time-offset
+        system_time  : float — current system time
+        tau_0: float — current time offset
         T            : float — horizon
-
+        human_state  : Optional[ObservableState] — human state
         Returns
         -------
         trajectory : list of FullState
         """
 
         trajectory = [robot_state]
-        t_span = np.arange(0, T, self.dt)
+        t_span = np.arange(system_time, system_time + T, self.dt)
 
         for t in t_span:
             x = np.array(
@@ -891,33 +920,122 @@ class TVBCBF(Policy):
             robot_state = new_robot_state
             trajectory.append(robot_state)
 
-        # # FOR DEBUGGING: PLOT BACKUP TRAJECTORY
-        # states = np.array([[state.px, state.py] for state in trajectory])
-        # ts = np.arange(len(trajectory)) * self.dt
-
-        # fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-        # ax = axes[0]
-        # ax.plot(states[:, 0], states[:, 1], "k-.", linewidth=1.0, alpha=0.5)
-        # ax.add_patch(plt.Circle((5.0, 0.0), 0.1, color="red", alpha=0.8, label="Human"))
-
-        # ax.legend()
-        # ax.set_xlabel("x (m)")
-        # ax.set_ylabel("y (m)")
-        # ax.set_title("Backup Trajectory")
-        # ax.grid(True)
-
-        # ax = axes[1]
-        # ax.plot(ts, states[:, 0], "b-", linewidth=1.5, label="x position")
-        # ax.plot(ts, states[:, 1], "r--", linewidth=1.5, label="y position")
-        # ax.set_xlabel("Time (s)")
-        # ax.set_ylabel("Position (m)")
-        # ax.set_title("Position vs Time")
-        # ax.legend()
-        # ax.grid(True)
-
-        # plt.tight_layout()
-        # plt.show()
         return trajectory
+
+    # ------------------------------------------------------------------
+    # Debug plotting  (called once per predict() step)
+    # ------------------------------------------------------------------
+
+    def _debug_plot(
+        self,
+        trajectory: List[FullState],
+        human_states: List[ObservableState],
+        h_safe_vals: List,
+        h_backup_val,
+        h_I: float,
+    ):
+        """
+        Draw (or refresh) a single persistent 2×3 figure:
+          Row 0 — current backup trajectory:
+            [0,0] XY path  |  [0,1] position vs horizon time  |  [0,2] speed vs horizon time
+          Row 1 — episode-level CBF history:
+            [1,0] min h_safe  |  [1,1] h_backup  |  [1,2] h_I
+        """
+        states = np.array([[s.px, s.py, s.vx, s.vy] for s in trajectory])
+        ts = np.arange(len(trajectory)) * self.dt
+        ep_ts = np.arange(len(self.h_Is)) * self.dt  # episode time axis
+
+        if not hasattr(self, "_debug_fig") or not plt.fignum_exists(
+            self._debug_fig.number
+        ):
+            self._debug_fig, self._debug_axes = plt.subplots(2, 3, figsize=(15, 8))
+        else:
+            for row in self._debug_axes:
+                for ax in row:
+                    ax.cla()
+
+        # --- [0,0]: XY trajectory ---
+        ax = self._debug_axes[0, 0]
+        ax.plot(states[:, 0], states[:, 1], "k-.", linewidth=1.0, alpha=0.6)
+        ax.plot(states[0, 0], states[0, 1], "gs", markersize=7, label="start")
+        ax.plot(states[-1, 0], states[-1, 1], "r*", markersize=10, label="end")
+        for hs in human_states:
+            ax.add_patch(
+                plt.Circle(
+                    (hs.px, hs.py), hs.radius, color="red", alpha=0.5, label="human"
+                )
+            )
+        ax.legend(fontsize=7)
+        ax.set_xlabel("x (m)")
+        ax.set_ylabel("y (m)")
+        ax.set_title("Backup Trajectory (XY)")
+        ax.grid(True)
+
+        # --- [0,1]: position vs horizon time ---
+        ax = self._debug_axes[0, 1]
+        ax.plot(ts, states[:, 0], "b-", linewidth=1.5, label="x")
+        ax.plot(ts, states[:, 1], "r--", linewidth=1.5, label="y")
+        ax.set_xlabel("Horizon time (s)")
+        ax.set_ylabel("Position (m)")
+        ax.set_title("Position vs Horizon Time")
+        ax.legend(fontsize=7)
+        ax.grid(True)
+
+        # --- [0,2]: speed vs horizon time ---
+        ax = self._debug_axes[0, 2]
+        ax.plot(
+            ts,
+            np.linalg.norm(states[:, 2:], axis=1),
+            "g-",
+            linewidth=1.5,
+            label="speed",
+        )
+        ax.axhline(
+            self.safety.backup_speed_threshold,
+            color="r",
+            linestyle="--",
+            linewidth=1.5,
+            label="threshold",
+        )
+        ax.set_xlabel("Horizon time (s)")
+        ax.set_ylabel("Speed (m/s)")
+        ax.set_title("Speed vs Horizon Time")
+        ax.legend(fontsize=7)
+        ax.grid(True)
+
+        # --- [1,0]: min h_safe over episode ---
+        ax = self._debug_axes[1, 0]
+        ax.plot(ep_ts, self.h_safe_mins, "b-", linewidth=1.5, label="min h_safe")
+        ax.axhline(0, color="r", linewidth=0.8, linestyle="--")
+        ax.set_xlabel("Episode time (s)")
+        ax.set_ylabel("Value")
+        ax.set_title("Min h_safe (over horizon & humans)")
+        ax.legend(fontsize=7)
+        ax.grid(True)
+
+        # --- [1,1]: h_backup over episode ---
+        ax = self._debug_axes[1, 1]
+        ax.plot(ep_ts, self.h_backups, color="purple", linewidth=1.5, label="h_backup")
+        ax.axhline(0, color="r", linewidth=0.8, linestyle="--")
+        ax.set_xlabel("Episode time (s)")
+        ax.set_ylabel("Value")
+        ax.set_title("h_backup (terminal backup state)")
+        ax.legend(fontsize=7)
+        ax.grid(True)
+
+        # --- [1,2]: h_I over episode ---
+        ax = self._debug_axes[1, 2]
+        ax.plot(ep_ts, self.h_Is, "k-", linewidth=1.5, label="h_I")
+        ax.axhline(0, color="r", linewidth=0.8, linestyle="--")
+        ax.set_xlabel("Episode time (s)")
+        ax.set_ylabel("Value")
+        ax.set_title("h_I (implicit CBF)")
+        ax.legend(fontsize=7)
+        ax.grid(True)
+
+        self._debug_fig.tight_layout()
+        self._debug_fig.canvas.draw()
+        plt.pause(0.001)
 
     # ------------------------------------------------------------------
     # Regulation function  (eq. 7-8)  — fully implemented
@@ -954,7 +1072,14 @@ class TVBCBF(Policy):
             u_backup_act = np.array([u_backup.ax, u_backup.ay])
 
         lam = 1.0 - np.exp(-self.beta * max(0.0, h_I))
+
+        # clip lambda to be between 0 and 1
+        lam = np.clip(lam, 0.0, 1.0)
+
         u_act = lam * u_des_act + (1.0 - lam) * u_backup_act
+
+        # Saturate the action
+        u_act = np.clip(u_act, -1.0, 1.0)
 
         self.lambdas.append(lam)
 
@@ -1030,7 +1155,7 @@ class RobustnessTerms:
 if __name__ == "__main__":
     from crowd_sim.envs.utils.state import FullState, ObservableState, JointState
 
-    total_time = 10.0
+    total_time = 15.0
 
     # -- Build maneuvers ----------
     maneuvers = [EvadeManeuver()]
@@ -1039,12 +1164,13 @@ if __name__ == "__main__":
     policy = TVBCBF()
     policy.kinematics = "holonomic"
     policy.build_default_tbcs(
-        maneuvers=maneuvers, backup_mode="stop", T_M=5.0, delta=2.0
+        maneuvers=maneuvers, backup_mode="stop", T_M=1.0, delta=0.3
     )
     policy.T = 5.0
+    policy.debug = False
     desired_frequency = 20.0  # Hz
     policy.dt = 1.0 / desired_frequency
-    policy.beta = 100.0
+    policy.beta = 20.0
     policy.time_step = policy.dt
     policy.total_time = total_time
 
@@ -1055,19 +1181,19 @@ if __name__ == "__main__":
     robot = FullState(
         px=0.0,
         py=0.0,
-        vx=5.0,
+        vx=1.5,
         vy=0.0,
         radius=0.1,
         gx=40.0,
         gy=0.0,
-        v_pref=1.0,
+        v_pref=1.5,
         theta=0.0,
     )
-    human = ObservableState(px=20.0, py=0.0, vx=0.0, vy=0.0, radius=0.1)
+    human = ObservableState(px=15.0, py=0.0, vx=0.0, vy=0.0, radius=0.1)
     state = JointState(robot, [human])
 
     # -- Nominal policy is a simple goal-seeking policy
-    policy.set_nominal_policy(GoStraight())
+    policy.set_nominal_policy(LinearAcceleration())
 
     tbc = policy.tbcs[0]
     print(f"TBC: {tbc}")
@@ -1083,7 +1209,7 @@ if __name__ == "__main__":
         # Current time
         t = i * policy.dt
         # Get the action from the policy
-        action = policy.predict(state, t=t)
+        action = policy.predict(state)
         # Disturbance
         dist = np.random.uniform(-1.0, 1.0, size=2)
         dist = np.concatenate([np.array([0.0, 0.0]), dist])
@@ -1129,8 +1255,10 @@ if __name__ == "__main__":
     # ---------------------------------------------------------------------------
     xs = np.array([s.self_state.px for s in trajectory])
     ys = np.array([s.self_state.py for s in trajectory])
+    vxs = np.array([s.self_state.vx for s in trajectory])
+    vys = np.array([s.self_state.vy for s in trajectory])
     ts = np.arange(len(trajectory)) * policy.time_step
-    backup_N = 5
+    backup_N = 20
 
     # --- Plot 1: XY trajectory ---
     fig1, ax1 = plt.subplots()
@@ -1170,10 +1298,10 @@ if __name__ == "__main__":
     fig1.savefig("simulate_flow_trajectory.png", dpi=150)
 
     # ---
-    fig, axes = plt.subplots(1, 5, figsize=(14, 5))
+    fig, axes = plt.subplots(1, 1, figsize=(14, 5))
 
     # --- Plot 2: x and y vs time ---
-    ax2 = axes[0]
+    ax2 = axes
     ax2.plot(ts, xs, "b-", linewidth=1.5, label="x position")
     ax2.plot(ts, ys, "r--", linewidth=1.5, label="y position")
     ax2.set_xlabel("Time (s)")
@@ -1182,8 +1310,34 @@ if __name__ == "__main__":
     ax2.legend()
     ax2.grid(True)
 
+    # # --- Plot 3: speed vs time ---
+    # ax3 = axes[1]
+    # ax3.plot(
+    #     ts,
+    #     np.linalg.norm(np.array([vxs, vys]), axis=0),
+    #     "g-",
+    #     linewidth=1.5,
+    #     label="speed",
+    # )
+    # ax3.axhline(
+    #     policy.safety.backup_speed_threshold,
+    #     color="r",
+    #     linestyle="--",
+    #     linewidth=1.5,
+    #     label="backup speed threshold",
+    # )
+    # ax3.set_xlabel("Time (s)")
+    # ax3.set_ylabel("Speed (m/s)")
+    # ax3.set_title("Speed vs Time")
+    # ax3.legend()
+    # ax3.grid(True)
+
+    fig.savefig("simulate_states.png", dpi=150)
+
+    fig2, axes2 = plt.subplots(1, 4, figsize=(14, 5))
+
     # --- Plot 3: lambda vs time ---
-    ax3 = axes[1]
+    ax3 = axes2[0]
     ax3.plot(ts[:-1], policy.lambdas, "g--", linewidth=1.5, label="lambda")
     ax3.hlines(1.0, 0, total_time, colors="k", linewidth=1.5, label="Desired Action")
     ax3.hlines(0.0, 0, total_time, colors="r", linewidth=1.5, label="Backup Action")
@@ -1193,29 +1347,33 @@ if __name__ == "__main__":
     ax3.legend()
     ax3.grid(True)
 
-    # --- Plot 4: h_I, h vs time ---
-    ax4 = axes[2]
-    ax4.plot(ts[:-1], h_vals, "b-", linewidth=1.5, label="h")
+    # --- Plot 4: h_I vs time ---
+    ax4 = axes2[1]
     ax4.plot(ts[:-1], policy.h_Is, "g--", linewidth=1.5, label="h_I")
     ax4.set_xlabel("Time (s)")
-    ax4.set_ylabel("h, h_I")
-    ax4.set_title("h, h_I vs Time")
+    ax4.set_ylabel("h_I")
+    ax4.set_title("h_I vs Time")
     ax4.legend()
     ax4.grid(True)
-    print("Plots saved to simulate_flow_trajectory.png")
 
     # --- Plot 5: tau_0 vs time ---
-    ax5 = axes[3]
-    ax5.plot(ts[:-1], policy.taus, "b-", linewidth=1.5, label="tau_0")
+    ax5 = axes2[2]
+    ax5.plot(
+        ts[:-1],
+        np.array(policy.system_times) - np.array(policy.tau_0s),
+        "b-",
+        linewidth=1.5,
+        label="system_time - tau_0",
+    )
     ax5.set_xlabel("Time (s)")
-    ax5.set_ylabel("tau_0")
-    ax5.set_title("tau_0 vs Time")
+    ax5.set_ylabel("system_time - tau_0")
+    ax5.set_title("system_time - tau_0 vs Time")
     ax5.legend()
     ax5.grid(True)
     # plt.tight_layout()
 
     # --- Plot 6: actions vs time ---
-    ax6 = axes[4]
+    ax6 = axes2[3]
     ax6.plot(ts[:-1], np.array(policy.actions)[:, 0], "b-", linewidth=1.5, label="ax")
     ax6.plot(ts[:-1], np.array(policy.actions)[:, 1], "r--", linewidth=1.5, label="ay")
     ax6.set_xlabel("Time (s)")
@@ -1223,5 +1381,7 @@ if __name__ == "__main__":
     ax6.set_title("Actions vs Time")
     ax6.legend()
     ax6.grid(True)
-    plt.savefig("simulate_flow_tau_0.png", dpi=150)
+    fig2.savefig("simulate_flow_tau_0.png", dpi=150)
     plt.show()
+
+    k = 5
