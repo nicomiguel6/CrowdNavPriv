@@ -27,7 +27,7 @@ from scipy.integrate import solve_ivp
 import matplotlib.pyplot as plt
 
 from crowd_sim.envs.policy.policy import Policy
-from crowd_sim.envs.policy.linear import Linear, LinearAcceleration
+from crowd_sim.envs.policy.linear import Linear, LinearAcceleration, GoStraight
 from crowd_sim.envs.utils.action import ActionXY, ActionRot, ActionAcceleration
 from crowd_sim.envs.utils.state import FullState, ObservableState, JointState
 
@@ -1039,7 +1039,7 @@ if __name__ == "__main__":
     policy = TVBCBF()
     policy.kinematics = "holonomic"
     policy.build_default_tbcs(
-        maneuvers=maneuvers, backup_mode="stop", T_M=1.0, delta=0.5
+        maneuvers=maneuvers, backup_mode="stop", T_M=5.0, delta=2.0
     )
     policy.T = 5.0
     desired_frequency = 20.0  # Hz
@@ -1055,19 +1055,19 @@ if __name__ == "__main__":
     robot = FullState(
         px=0.0,
         py=0.0,
-        vx=1.0,
+        vx=5.0,
         vy=0.0,
         radius=0.1,
-        gx=15.0,
+        gx=40.0,
         gy=0.0,
-        v_pref=5.0,
+        v_pref=1.0,
         theta=0.0,
     )
-    human = ObservableState(px=7.0, py=0.0, vx=0.0, vy=0.0, radius=0.1)
+    human = ObservableState(px=20.0, py=0.0, vx=0.0, vy=0.0, radius=0.1)
     state = JointState(robot, [human])
 
     # -- Nominal policy is a simple goal-seeking policy
-    policy.set_nominal_policy(LinearAcceleration())
+    policy.set_nominal_policy(GoStraight())
 
     tbc = policy.tbcs[0]
     print(f"TBC: {tbc}")
@@ -1087,6 +1087,7 @@ if __name__ == "__main__":
         # Disturbance
         dist = np.random.uniform(-1.0, 1.0, size=2)
         dist = np.concatenate([np.array([0.0, 0.0]), dist])
+        dist = np.array([0.0, 0.0, 0.0, 0.0])
 
         # Propagate robot state forward using the action
         x = np.array([robot.px, robot.py, robot.vx, robot.vy], dtype=float)
