@@ -581,7 +581,7 @@ class TVBCBF(Policy):
         """
         # INPUT --------------------------------------------------------------
         # Get the candidate time offset
-        tau_0 = system_time  # - dt  # + self.delta_tau
+        tau_0 = system_time  # - dt + self.delta_tau
 
         # OUTPUT -------------------------------------------------------------
         # Propagate the system state forward using the TBC
@@ -1300,13 +1300,12 @@ if __name__ == "__main__":
     # ---
     fig, axes = plt.subplots(1, 1, figsize=(14, 5))
 
-    # --- Plot 2: x and y vs time ---
+    # --- Plot 2: relative time vs system time ---
     ax2 = axes
-    ax2.plot(ts, xs, "b-", linewidth=1.5, label="x position")
-    ax2.plot(ts, ys, "r--", linewidth=1.5, label="y position")
+    ax2.plot(ts[:-1], policy.relative_times, "b-", linewidth=1.5, label="Relative Time")
     ax2.set_xlabel("Time (s)")
-    ax2.set_ylabel("Position (m)")
-    ax2.set_title("Position vs Time")
+    ax2.set_ylabel("Relative Time (s)")
+    ax2.set_title("Relative Time vs System Time")
     ax2.legend()
     ax2.grid(True)
 
