@@ -119,25 +119,38 @@ class EvadeManeuver(BackupManeuver):
 
     # For now, we want a simpler method that does not depend on the human states
     def compute_action(
-        self, robot_state, evade_position, **kwargs
+        self,
+        robot_state: FullState,
+        human_states: List[ObservableState],
+        evade_position: float = 0.5,
+        **kwargs,
     ) -> ActionXY | ActionRot | ActionAcceleration:
 
         # check if kwargs contains gains
         if "gains" in kwargs:
             gains = kwargs["gains"]
         else:
-            gains = [10.0, 10.0]
+            gains = [1.0, 20.0, 4.0]
 
         # Desired position lane (since we are always moving in the x direction, we want this to be a jump in the y direction)
+        # TODO: PD control to the desired position lane
+        # desired_maneuver = np.array(
+        #     [
+        #         0.0,
+        #         gains[1] * (evade_position - robot_state.py)
+        #         + gains[2] * (-robot_state.vy),
+        #     ]
+        # )
+
         # desired_maneuver = np.array(
         #     [0.0, gains[1] * (robot_state.v_pref - robot_state.vy)]
         # )
         desired_maneuver = np.array(
-            [0.0, gains[1] * 1.0]
+            [0.0, gains[1]]
         )  # constant acceleration in the y direction
 
         # Saturate the acceleration
-        desired_maneuver = np.clip(desired_maneuver, -1.0, 1.0)
+        # desired_maneuver = np.clip(desired_maneuver, -1.0, 1.0)
 
         return ActionAcceleration(desired_maneuver[0], desired_maneuver[1])
 
@@ -154,7 +167,7 @@ class BackupController:
     stop" or "retreat from nearest obstacle" controller.
     """
 
-    def __init__(self, mode: str = "stop", gain: np.ndarray = np.array([10.0, 10.0])):
+    def __init__(self, mode: str = "stop", gain: np.ndarray = np.array([100.0, 100.0])):
         self.mode = mode
         self.gain = gain
 
@@ -225,7 +238,9 @@ class TimeVaryingBackupController:
         """
         if human_states is None:
             human_states = []
-        u_m = self.maneuver.compute_action(robot_state, human_states, **kwargs)
+        u_m = self.maneuver.compute_action(
+            robot_state=robot_state, human_states=human_states, **kwargs
+        )
         u_b = self.backup.compute_action(robot_state, human_states)
 
         if relative_time <= self.T_M:
@@ -334,6 +349,9 @@ class TVBCBF(Policy):
         self.multiagent_training = None
         self.kinematics = "holonomic"
         self.debug = False
+        # Separate from `debug`: only the backup horizon from simulate_flow as used
+        # in compute_time_offset (own figure; does not mix with _debug_plot).
+        self.debug_backup_flow = False
         # integration options
         self.int_options = {"rtol": 1e-6, "atol": 1e-6}
 
@@ -375,6 +393,9 @@ class TVBCBF(Policy):
         # Safety primitives
         self.safety = SafetyConstraints()
 
+        # Engage backup fully (when on, this holds lambda at 0)
+        self.full_backup = True
+
         # 2-D single-integrator matrices  (state = [px, py], u = [vx, vy])
         #   ẋ = A x + B u  →  ṗ = v  (velocity is the direct control input)
         self.A = np.array(
@@ -396,6 +417,9 @@ class TVBCBF(Policy):
                 "tvbcbf", "backup_speed_threshold"
             )
             self.debug = config.getboolean("tvbcbf", "debug")
+            self.debug_backup_flow = config.getboolean(
+                "tvbcbf", "debug_backup_flow", fallback=False
+            )
 
         if config.has_section("action_space"):
             self.kinematics = config.get("action_space", "kinematics")
@@ -477,6 +501,9 @@ class TVBCBF(Policy):
             )
         )
 
+        if self.full_backup:
+            self.tau_0 = 0.0
+
         # Store backup trajectory
         bt_array = []
         for bt in backup_trajectory:
@@ -509,6 +536,7 @@ class TVBCBF(Policy):
         h_I = self.compute_implicit_cbf(
             backup_trajectory, human_states, h_safe_vals, h_backup_val
         )
+
         self.h_Is.append(h_I)
         self.h_safe_mins.append(min(min(vals) for vals in h_safe_vals))
         self.h_backups.append(float(np.min(h_backup_val)))
@@ -581,7 +609,10 @@ class TVBCBF(Policy):
         """
         # INPUT --------------------------------------------------------------
         # Get the candidate time offset
-        tau_0 = system_time  # - dt + self.delta_tau
+        if self.full_backup:
+            tau_0 = 0.0  # system_time  # - dt + self.delta_tau
+        else:
+            tau_0 = system_time
 
         # OUTPUT -------------------------------------------------------------
         # Propagate the system state forward using the TBC
@@ -601,6 +632,8 @@ class TVBCBF(Policy):
             # print("h_min: ", h_min)
             # print("h_backup_val_min: ", h_backup_val_min)
             # print("h_I: ", h_I)
+            if self.debug_backup_flow:
+                self._plot_backup_flow_only(traj, human_states)
             return tau_0, traj, h_safe_vals, h_backup_val
         else:
             # Decrement the candidate time offset
@@ -622,6 +655,8 @@ class TVBCBF(Policy):
             # print("h_min: ", h_min)
             # print("h_backup_val_min: ", h_backup_val_min)
             # print("h_I: ", h_I)
+            if self.debug_backup_flow:
+                self._plot_backup_flow_only(new_traj, human_states)
             return tau_0, new_traj, h_safe_vals, h_backup_val
 
     # ------------------------------------------------------------------
@@ -923,39 +958,24 @@ class TVBCBF(Policy):
         return trajectory
 
     # ------------------------------------------------------------------
-    # Debug plotting  (called once per predict() step)
+    # Debug plotting
     # ------------------------------------------------------------------
 
-    def _debug_plot(
+    def _plot_backup_horizon_axes(
         self,
+        axes,
         trajectory: List[FullState],
         human_states: List[ObservableState],
-        h_safe_vals: List,
-        h_backup_val,
-        h_I: float,
     ):
         """
-        Draw (or refresh) a single persistent 2×3 figure:
-          Row 0 — current backup trajectory:
-            [0,0] XY path  |  [0,1] position vs horizon time  |  [0,2] speed vs horizon time
-          Row 1 — episode-level CBF history:
-            [1,0] min h_safe  |  [1,1] h_backup  |  [1,2] h_I
+        The three backup-horizon panels shared by _debug_plot (row 0) and
+        _plot_backup_flow_only: XY path, position vs horizon time, speed vs t.
+        `axes` is a 1×3 array of Axes.
         """
         states = np.array([[s.px, s.py, s.vx, s.vy] for s in trajectory])
         ts = np.arange(len(trajectory)) * self.dt
-        ep_ts = np.arange(len(self.h_Is)) * self.dt  # episode time axis
 
-        if not hasattr(self, "_debug_fig") or not plt.fignum_exists(
-            self._debug_fig.number
-        ):
-            self._debug_fig, self._debug_axes = plt.subplots(2, 3, figsize=(15, 8))
-        else:
-            for row in self._debug_axes:
-                for ax in row:
-                    ax.cla()
-
-        # --- [0,0]: XY trajectory ---
-        ax = self._debug_axes[0, 0]
+        ax = axes[0]
         ax.plot(states[:, 0], states[:, 1], "k-.", linewidth=1.0, alpha=0.6)
         ax.plot(states[0, 0], states[0, 1], "gs", markersize=7, label="start")
         ax.plot(states[-1, 0], states[-1, 1], "r*", markersize=10, label="end")
@@ -971,8 +991,7 @@ class TVBCBF(Policy):
         ax.set_title("Backup Trajectory (XY)")
         ax.grid(True)
 
-        # --- [0,1]: position vs horizon time ---
-        ax = self._debug_axes[0, 1]
+        ax = axes[1]
         ax.plot(ts, states[:, 0], "b-", linewidth=1.5, label="x")
         ax.plot(ts, states[:, 1], "r--", linewidth=1.5, label="y")
         ax.set_xlabel("Horizon time (s)")
@@ -981,8 +1000,7 @@ class TVBCBF(Policy):
         ax.legend(fontsize=7)
         ax.grid(True)
 
-        # --- [0,2]: speed vs horizon time ---
-        ax = self._debug_axes[0, 2]
+        ax = axes[2]
         ax.plot(
             ts,
             np.linalg.norm(states[:, 2:], axis=1),
@@ -1002,6 +1020,63 @@ class TVBCBF(Policy):
         ax.set_title("Speed vs Horizon Time")
         ax.legend(fontsize=7)
         ax.grid(True)
+
+    def _plot_backup_flow_only(
+        self,
+        trajectory: List[FullState],
+        human_states: List[ObservableState],
+    ):
+        """
+        Dedicated figure for the backup flow returned by simulate_flow inside
+        compute_time_offset (one refresh per call). Uses the same three panels
+        as the top row of _debug_plot, but not the episode-level CBF row.
+        """
+        if not hasattr(self, "_debug_backup_flow_fig") or not plt.fignum_exists(
+            self._debug_backup_flow_fig.number
+        ):
+            self._debug_backup_flow_fig, self._debug_backup_flow_axes = plt.subplots(
+                1, 3, figsize=(15, 4)
+            )
+        else:
+            for ax in self._debug_backup_flow_axes:
+                ax.cla()
+        self._debug_backup_flow_fig.suptitle(
+            "Backup flow: simulate_flow in compute_time_offset", fontsize=11, y=1.02
+        )
+        self._plot_backup_horizon_axes(
+            self._debug_backup_flow_axes, trajectory, human_states
+        )
+        self._debug_backup_flow_fig.tight_layout(rect=(0, 0, 1, 0.92))
+        self._debug_backup_flow_fig.canvas.draw()
+        plt.pause(0.001)
+
+    def _debug_plot(
+        self,
+        trajectory: List[FullState],
+        human_states: List[ObservableState],
+        h_safe_vals: List,
+        h_backup_val,
+        h_I: float,
+    ):
+        """
+        Draw (or refresh) a single persistent 2×3 figure:
+          Row 0 — current backup trajectory:
+            [0,0] XY path  |  [0,1] position vs horizon time  |  [0,2] speed vs horizon time
+          Row 1 — episode-level CBF history:
+            [1,0] min h_safe  |  [1,1] h_backup  |  [1,2] h_I
+        """
+        ep_ts = np.arange(len(self.h_Is)) * self.dt  # episode time axis
+
+        if not hasattr(self, "_debug_fig") or not plt.fignum_exists(
+            self._debug_fig.number
+        ):
+            self._debug_fig, self._debug_axes = plt.subplots(2, 3, figsize=(15, 8))
+        else:
+            for row in self._debug_axes:
+                for ax in row:
+                    ax.cla()
+
+        self._plot_backup_horizon_axes(self._debug_axes[0, :], trajectory, human_states)
 
         # --- [1,0]: min h_safe over episode ---
         ax = self._debug_axes[1, 0]
@@ -1076,10 +1151,13 @@ class TVBCBF(Policy):
         # clip lambda to be between 0 and 1
         lam = np.clip(lam, 0.0, 1.0)
 
+        if self.full_backup:
+            lam = 0.0
+
         u_act = lam * u_des_act + (1.0 - lam) * u_backup_act
 
         # Saturate the action
-        u_act = np.clip(u_act, -1.0, 1.0)
+        # u_act = np.clip(u_act, -1.0, 1.0)
 
         self.lambdas.append(lam)
 
@@ -1155,7 +1233,7 @@ class RobustnessTerms:
 if __name__ == "__main__":
     from crowd_sim.envs.utils.state import FullState, ObservableState, JointState
 
-    total_time = 15.0
+    total_time = 30.0
 
     # -- Build maneuvers ----------
     maneuvers = [EvadeManeuver()]
@@ -1164,15 +1242,21 @@ if __name__ == "__main__":
     policy = TVBCBF()
     policy.kinematics = "holonomic"
     policy.build_default_tbcs(
-        maneuvers=maneuvers, backup_mode="stop", T_M=1.0, delta=0.3
+        maneuvers=maneuvers,
+        backup_mode="stop",
+        T_M=0.7,
+        delta=0.05,
+        backup_gain=np.array([40.0, 40.0]),
     )
-    policy.T = 5.0
+    policy.T = 1.5
     policy.debug = False
-    desired_frequency = 20.0  # Hz
+    policy.debug_backup_flow = False
+    desired_frequency = 80.0  # Hz
     policy.dt = 1.0 / desired_frequency
-    policy.beta = 20.0
+    policy.beta = 100.0
     policy.time_step = policy.dt
     policy.total_time = total_time
+    policy.full_backup = False
 
     print(f"Policy: {policy.name}")
     print(f"Registered TBCs: {policy.tbcs}")
@@ -1278,6 +1362,17 @@ if __name__ == "__main__":
                 alpha=0.5,
                 label=label,
             )
+        # joint_state = trajectory[i]
+        # robot_state = joint_state.self_state
+        # if robot_state.px > 13.5 and robot_state.px < 15.45:
+        #     ax1.plot(
+        #         policy.backup_trajectories[i][:, 0],
+        #         policy.backup_trajectories[i][:, 1],
+        #         "k-.",
+        #         linewidth=1.0,
+        #         alpha=0.5,
+        #         label=label,
+        #     )
 
     ax1.add_patch(
         plt.Circle(
@@ -1309,11 +1404,11 @@ if __name__ == "__main__":
     ax2.legend()
     ax2.grid(True)
 
-    # # --- Plot 3: speed vs time ---
-    # ax3 = axes[1]
+    # # --- Plot 3: position vs time ---
+    # ax3 = axes
     # ax3.plot(
     #     ts,
-    #     np.linalg.norm(np.array([vxs, vys]), axis=0),
+    #     xs,
     #     "g-",
     #     linewidth=1.5,
     #     label="speed",
@@ -1331,7 +1426,7 @@ if __name__ == "__main__":
     # ax3.legend()
     # ax3.grid(True)
 
-    fig.savefig("simulate_states.png", dpi=150)
+    # fig.savefig("simulate_states.png", dpi=150)
 
     fig2, axes2 = plt.subplots(1, 4, figsize=(14, 5))
 
