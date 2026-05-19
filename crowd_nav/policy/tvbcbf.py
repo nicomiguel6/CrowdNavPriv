@@ -31,7 +31,7 @@ from crowd_sim.envs.policy.linear import Linear, LinearAcceleration, GoStraight
 from crowd_sim.envs.utils.action import ActionXY, ActionRot, ActionAcceleration
 from crowd_sim.envs.utils.state import FullState, ObservableState, JointState
 
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Sequence
 import tqdm
 
 # ---------------------------------------------------------------------------
@@ -292,8 +292,8 @@ class SafetyConstraints:
         """
         values = []
         for hs in human_states:
-            d = norm([robot_state.px - hs.px, robot_state.py - hs.py])
-            d_safe = robot_state.radius + hs.radius + self.safety_radius
+            d = norm([robot_state.px - hs.px, robot_state.py - hs.py]) ** 2
+            d_safe = (robot_state.radius + hs.radius + self.safety_radius) ** 2
             values.append(d - d_safe)
         return values
 
@@ -392,6 +392,10 @@ class TVBCBF(Policy):
 
         # Safety primitives
         self.safety = SafetyConstraints()
+        self.robustness_terms = RobustnessTerms(self)
+        self.epsilon_tau = [0.0]
+        self.epsilon_backup = 0.0
+        self._robustness_initialized = False
 
         # Engage backup fully (when on, this holds lambda at 0)
         self.full_backup = True
@@ -420,6 +424,24 @@ class TVBCBF(Policy):
             self.debug_backup_flow = config.getboolean(
                 "tvbcbf", "debug_backup_flow", fallback=False
             )
+            self.robustness_terms.Lh_const = config.getfloat(
+                "tvbcbf", "Lh_const", fallback=self.robustness_terms.Lh_const
+            )
+            self.robustness_terms.Lhb_const = config.getfloat(
+                "tvbcbf", "Lhb_const", fallback=self.robustness_terms.Lhb_const
+            )
+            self.robustness_terms.L_cl = config.getfloat(
+                "tvbcbf", "L_cl", fallback=self.robustness_terms.L_cl
+            )
+            self.robustness_terms.dw_max = config.getfloat(
+                "tvbcbf", "dw_max", fallback=self.robustness_terms.dw_max
+            )
+            self.robustness_terms.dv_max = config.getfloat(
+                "tvbcbf", "dv_max", fallback=self.robustness_terms.dv_max
+            )
+            self.robustness_terms.bound_type = config.get(
+                "tvbcbf", "robustness_bound", fallback=self.robustness_terms.bound_type
+            ).lower()
 
         if config.has_section("action_space"):
             self.kinematics = config.get("action_space", "kinematics")
@@ -489,7 +511,16 @@ class TVBCBF(Policy):
         # 1) Desired action from nominal policy
         u_des = self._get_desired_action(state)
 
+        # Initialize robustness terms at the very beginning so the first
+        # time-offset feasibility check uses valid epsilons.
+        if not self._robustness_initialized:
+            self.epsilon_tau, self.epsilon_backup = self.robustness_terms.compute(
+                horizon=self.T, dt=self.dt, offset_time=self.tau_0
+            )
+            self._robustness_initialized = True
+
         # 2) Update time-offset  (Algorithm 1)
+        tau_0_prev = self.tau_0
         self.tau_0, backup_trajectory, h_safe_vals, h_backup_val = (
             self.compute_time_offset(
                 robot_state=robot_state,
@@ -503,6 +534,12 @@ class TVBCBF(Policy):
 
         if self.full_backup:
             self.tau_0 = 0.0
+
+        # # Recompute robustness terms only when tau_0 changes.
+        # if not np.isclose(self.tau_0, tau_0_prev):
+        #     self.epsilon_tau, self.epsilon_backup = self.robustness_terms.compute(
+        #         horizon=self.T, dt=self.dt, offset_time=self.tau_0
+        #     )
 
         # Store backup trajectory
         bt_array = []
@@ -538,7 +575,9 @@ class TVBCBF(Policy):
         )
 
         self.h_Is.append(h_I)
-        self.h_safe_mins.append(min(min(vals) for vals in h_safe_vals))
+        self.h_safe_mins.append(
+            float(np.min(h_safe_vals)) if len(h_safe_vals) > 0 else np.inf
+        )
         self.h_backups.append(float(np.min(h_backup_val)))
 
         # FOR DEBUGGING: plot backup trajectory and CBF values
@@ -624,9 +663,14 @@ class TVBCBF(Policy):
             T=self.T,
             human_state=human_states[0],
         )
-        safe_bool, h_safe_vals, h_backup_val = self._tbc_is_feasible(traj, human_states)
+        safe_bool, h_safe_vals, h_backup_val = self._tbc_is_feasible(
+            traj,
+            human_states,
+            epsilon_tau=self.epsilon_tau,
+            epsilon_backup=self.epsilon_backup,
+        )
         if safe_bool:
-            h_min = np.min([val for val in h_safe_vals])
+            h_min = np.min(h_safe_vals) if len(h_safe_vals) > 0 else np.inf
             h_backup_val_min = np.min(h_backup_val)
             h_I = min(h_min, h_backup_val_min)
             # print("h_min: ", h_min)
@@ -647,9 +691,12 @@ class TVBCBF(Policy):
                 human_state=human_states[0],
             )
             safe_bool, h_safe_vals, h_backup_val = self._tbc_is_feasible(
-                new_traj, human_states
+                new_traj,
+                human_states,
+                epsilon_tau=self.epsilon_tau,
+                epsilon_backup=self.epsilon_backup,
             )
-            h_min = np.min([val for val in h_safe_vals])
+            h_min = np.min(h_safe_vals) if len(h_safe_vals) > 0 else np.inf
             h_backup_val_min = np.min(h_backup_val)
             h_I = min(h_min, h_backup_val_min)
             # print("h_min: ", h_min)
@@ -745,7 +792,7 @@ class TVBCBF(Policy):
         h_I : float — implicit CBF value (>= 0 means safe)
         """
 
-        h_vals_min = np.min([val for val in h_vals])
+        h_vals_min = np.min(h_vals) if len(h_vals) > 0 else np.inf
 
         h_I = min(h_vals_min, h_backup_val)
 
@@ -759,9 +806,9 @@ class TVBCBF(Policy):
         self,
         traj: List[FullState],
         human_states: List[ObservableState],
-        epsilon_tau: float = 0.0,
+        epsilon_tau: float | Sequence[float] = 0.0,
         epsilon_backup: float = 0.0,
-    ) -> Tuple[bool, List[float], float]:
+    ) -> Tuple[bool, List[np.ndarray], float]:
         """
         Return True iff the trajectory under `tbc` from `robot_state`:
           (a) stays entirely inside the safe set S  (h_safe >= 0 at every step), and
@@ -776,29 +823,38 @@ class TVBCBF(Policy):
 
         Returns
         -------
-        bool, List[float], float
+        bool, List[np.ndarray], float
         """
 
-        # # For every state in the trajectory, check if it is in the safe set
-        # for state in traj:
-        #     if not self.safety.h_safe(state, human_states):
-        #         return False
+        num_steps = len(traj)
+        num_humans = len(human_states)
+        h_safe_vals = [np.zeros(num_steps, dtype=float) for _ in range(num_humans)]
 
-        # # Check if the terminal state is in the backup set
-        # if not self.safety.h_backup(traj[-1]):
-        #     return False
-
-        h_safe_vals = []
-        for state in traj:
-            h_safe_vals.append(self.safety.h_safe(state, human_states))
+        for step_idx, state in enumerate(traj):
+            step_h_safe_vals = self.safety.h_safe(state, human_states)
+            for human_idx in range(num_humans):
+                h_safe_vals[human_idx][step_idx] = step_h_safe_vals[human_idx]
 
         h_backup_val = self.safety.h_backup(traj[-1])
 
-        # check if any of the h_safe_vals are less than epsilon_tau
-        for h_safe_val in h_safe_vals:
-            for val in h_safe_val:
-                if val < epsilon_tau:
-                    return False, h_safe_vals, h_backup_val
+        # Step-wise feasibility: compare this step's minimum safety value
+        # against this step's tightening epsilon.
+        for step_idx in range(num_steps):
+            if np.isscalar(epsilon_tau):
+                eps_tau = float(epsilon_tau)
+            else:
+                eps_idx = min(step_idx, len(epsilon_tau) - 1)
+                eps_tau = float(epsilon_tau[eps_idx])
+
+            if num_humans == 0:
+                step_min_h = np.inf
+            else:
+                step_min_h = min(
+                    h_safe_vals[human_idx][step_idx] for human_idx in range(num_humans)
+                )
+
+            if step_min_h < eps_tau:
+                return False, h_safe_vals, h_backup_val
 
         if h_backup_val < epsilon_backup:
             return False, h_safe_vals, h_backup_val
@@ -1203,6 +1259,7 @@ class TVBCBF(Policy):
         self.tau_0 = 0.0
         self.system_time = 0.0
         self.active_tbc_index = 0
+        self._robustness_initialized = False
         for tbc in self.tbcs:
             if isinstance(tbc.maneuver, CarryOnManeuver):
                 tbc.maneuver.held_action = np.array([0.0, 0.0])
@@ -1217,6 +1274,62 @@ class RobustnessTerms:
 
         self.Lh_const = 1.0
         self.Lhb_const = 1.0
+        self.L_cl = 1.0
+        self.dw_max = 0.0
+        self.dv_max = 0.0
+        self.bound_type = "do"
+        self.epsilon_t = [0.0]
+        self.epsilon_b = 0.0
+
+    def _delta_t_dr(self, t: float) -> float:
+        if t <= 0.0 or self.dw_max <= 0.0:
+            return 0.0
+        if abs(self.L_cl) < 1e-9:
+            return self.dw_max * t
+        return (self.dw_max / self.L_cl) * (np.exp(self.L_cl * t) - 1.0)
+
+    def _delta_t_do(self, t: float) -> float:
+        if t <= 0.0:
+            return 0.0
+        if abs(self.L_cl) < 1e-9:
+            return max(self.dw_max, self.dv_max) * t
+        e_bar = np.exp(-t) * self.dw_max + self.dv_max * (1.0 - np.exp(-t))
+        term1 = ((self.dv_max / (self.L_cl**2)) + (e_bar / self.L_cl)) * (
+            np.exp(self.L_cl * t) - 1.0
+        )
+        term2 = (self.dv_max / self.L_cl) * t
+        return max(term1 - term2, 0.0)
+
+    def _delta_t(self, t: float) -> float:
+        if self.bound_type == "dr":
+            return self._delta_t_dr(t)
+        return self._delta_t_do(t)
+
+    def compute(
+        self, horizon: float, dt: float, offset_time: float = 0.0
+    ) -> Tuple[List[float], float]:
+        if dt <= 0.0 or horizon <= 0.0:
+            self.epsilon_t = [0.0]
+            self.epsilon_b = 0.0
+            return self.epsilon_t, self.epsilon_b
+
+        rta_points = int(np.ceil(horizon / dt))
+        if rta_points <= 0:
+            self.epsilon_t = [0.0]
+            self.epsilon_b = 0.0
+            return self.epsilon_t, self.epsilon_b
+
+        epsilons = [0.0 for _ in range(rta_points)]
+        delta_terminal = 0.0
+        for i in range(1, rta_points):
+            t = offset_time + dt * i
+            delta_t = self._delta_t(t)
+            epsilons[i] = self.Lh_const * delta_t
+            delta_terminal = delta_t
+
+        self.epsilon_t = epsilons
+        self.epsilon_b = self.Lhb_const * delta_terminal
+        return self.epsilon_t, self.epsilon_b
 
     def get_epsilon_t(self):
 
@@ -1251,12 +1364,32 @@ if __name__ == "__main__":
     policy.T = 1.5
     policy.debug = False
     policy.debug_backup_flow = False
-    desired_frequency = 80.0  # Hz
+    desired_frequency = 80.0  # 80.0 Hz
     policy.dt = 1.0 / desired_frequency
     policy.beta = 100.0
     policy.time_step = policy.dt
     policy.total_time = total_time
     policy.full_backup = False
+
+    # --- Robustness terms setup ---
+
+    # Choose which bound to use: "do" (disturbance observer) or "dr" (disturbance robust)
+    policy.robustness_terms.bound_type = "dr"
+
+    # Constants from DR-bCBF / DO-bCBF setup
+    policy.robustness_terms.Lh_const = 1.0
+    policy.robustness_terms.Lhb_const = 1.0
+    policy.robustness_terms.L_cl = 0.2
+    policy.robustness_terms.dw_max = 0.05  # max disturbance bound
+    policy.robustness_terms.dv_max = 0.05  # observer error-rate bound (used by "do")
+
+    # Prime epsilon terms for current tau_0 (usually 0 at start)
+    policy.epsilon_tau, policy.epsilon_backup = policy.robustness_terms.compute(
+        horizon=policy.T,
+        dt=policy.dt,
+        offset_time=policy.tau_0,
+    )
+    policy._robustness_initialized = True
 
     print(f"Policy: {policy.name}")
     print(f"Registered TBCs: {policy.tbcs}")
@@ -1297,7 +1430,7 @@ if __name__ == "__main__":
         # Disturbance
         dist = np.random.uniform(-1.0, 1.0, size=2)
         dist = np.concatenate([np.array([0.0, 0.0]), dist])
-        dist = np.array([0.0, 0.0, 0.0, 0.0])
+        # dist = np.array([0.0, 0.0, 0.0, 0.0])
 
         # Propagate robot state forward using the action
         x = np.array([robot.px, robot.py, robot.vx, robot.vy], dtype=float)
