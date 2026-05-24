@@ -4,7 +4,10 @@ import gymnasium as gym
 from gymnasium import spaces
 import matplotlib.lines as mlines
 import numpy as np
-import rvo2
+try:
+    import rvo2
+except ImportError:
+    rvo2 = None
 from matplotlib import patches
 from numpy.linalg import norm
 from crowd_sim.envs.utils.human import Human

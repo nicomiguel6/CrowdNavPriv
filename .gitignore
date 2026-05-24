@@ -13,3 +13,8 @@ venv*/
 data/
 *.mp4
 videos/
+
+.venv/
+uv.lock
+pyproject.toml
+.python-version

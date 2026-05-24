@@ -16,6 +16,7 @@ Key concepts:
 
 import sys
 import os
+import math
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 import abc
@@ -134,20 +135,20 @@ class EvadeManeuver(BackupManeuver):
 
         # Desired position lane (since we are always moving in the x direction, we want this to be a jump in the y direction)
         # TODO: PD control to the desired position lane
-        # desired_maneuver = np.array(
-        #     [
-        #         0.0,
-        #         gains[1] * (evade_position - robot_state.py)
-        #         + gains[2] * (-robot_state.vy),
-        #     ]
-        # )
+        desired_maneuver = np.array(
+            [
+                0.0,
+                gains[1] * (evade_position - robot_state.py)
+                + gains[2] * (-robot_state.vy),
+            ]
+        )
 
         # desired_maneuver = np.array(
         #     [0.0, gains[1] * (robot_state.v_pref - robot_state.vy)]
         # )
-        desired_maneuver = np.array(
-            [0.0, gains[1]]
-        )  # constant acceleration in the y direction
+        # desired_maneuver = np.array(
+        #     [0.0, gains[1]]
+        # )  # constant acceleration in the y direction
 
         # Saturate the acceleration
         # desired_maneuver = np.clip(desired_maneuver, -1.0, 1.0)
@@ -392,10 +393,10 @@ class TVBCBF(Policy):
 
         # Safety primitives
         self.safety = SafetyConstraints()
-        self.robustness_terms = RobustnessTerms(self)
+        # self.robustness_terms = RobustnessTerms(self)
         self.epsilon_tau = [0.0]
         self.epsilon_backup = 0.0
-        self._robustness_initialized = False
+        # self._robustness_initialized = False
 
         # Engage backup fully (when on, this holds lambda at 0)
         self.full_backup = True
@@ -508,16 +509,18 @@ class TVBCBF(Policy):
         human_states = state.human_states
         tbc = self.tbcs[self.active_tbc_index]
 
+        # self.system_time = round(self.system_time, 3)
+
         # 1) Desired action from nominal policy
         u_des = self._get_desired_action(state)
 
         # Initialize robustness terms at the very beginning so the first
         # time-offset feasibility check uses valid epsilons.
-        if not self._robustness_initialized:
-            self.epsilon_tau, self.epsilon_backup = self.robustness_terms.compute(
-                horizon=self.T, dt=self.dt, offset_time=self.tau_0
-            )
-            self._robustness_initialized = True
+        # if not self._robustness_initialized:
+        #     self.epsilon_tau, self.epsilon_backup = self.robustness_terms.compute(
+        #         horizon=self.T, dt=self.dt, offset_time=self.tau_0
+        #     )
+        #     self._robustness_initialized = True
 
         # 2) Update time-offset  (Algorithm 1)
         tau_0_prev = self.tau_0
@@ -663,6 +666,13 @@ class TVBCBF(Policy):
             T=self.T,
             human_state=human_states[0],
         )
+
+        len_traj = len(traj)
+        px = [state.px for state in traj]
+        py = [state.py for state in traj]
+        vx = [state.vx for state in traj]
+        vy = [state.vy for state in traj]
+
         safe_bool, h_safe_vals, h_backup_val = self._tbc_is_feasible(
             traj,
             human_states,
@@ -839,13 +849,9 @@ class TVBCBF(Policy):
 
         # Step-wise feasibility: compare this step's minimum safety value
         # against this step's tightening epsilon.
-        for step_idx in range(num_steps):
-            if np.isscalar(epsilon_tau):
-                eps_tau = float(epsilon_tau)
-            else:
-                eps_idx = min(step_idx, len(epsilon_tau) - 1)
-                eps_tau = float(epsilon_tau[eps_idx])
-
+        for step_idx in range(num_steps-1):
+            # eps_tau = float(epsilon_tau[step_idx])
+            eps_tau = 0.0
             if num_humans == 0:
                 step_min_h = np.inf
             else:
@@ -975,16 +981,18 @@ class TVBCBF(Policy):
         """
 
         trajectory = [robot_state]
-        t_span = np.arange(system_time, system_time + T, self.dt)
+        N = int(math.ceil(T / self.dt))
 
-        for t in t_span:
+        # t_span = np.arange(system_time, system_time + T, self.dt)
+
+        for t in range(N):
             x = np.array(
                 [robot_state.px, robot_state.py, robot_state.vx, robot_state.vy],
                 dtype=float,
             )
             # 1) calculate robot action
             # print(f"t - tau_0: {t - tau_0}")
-            action = tbc.evaluate(t - tau_0, robot_state, human_states=None)
+            action = tbc.evaluate(self.system_time + t*self.dt - tau_0, robot_state, human_states=None)
 
             # 2) propagate robot state forward using the action and nominal dynamics
             new_x = self.integrateState(
@@ -1313,7 +1321,7 @@ class RobustnessTerms:
             self.epsilon_b = 0.0
             return self.epsilon_t, self.epsilon_b
 
-        rta_points = int(np.ceil(horizon / dt))
+        rta_points = int(np.ceil(horizon / dt)) + 1
         if rta_points <= 0:
             self.epsilon_t = [0.0]
             self.epsilon_b = 0.0
@@ -1348,6 +1356,9 @@ if __name__ == "__main__":
 
     total_time = 30.0
 
+    backup_gain = np.array([10.0, 10.0])
+    maneuver_gain = np.array([1.0, 20.0, 4.0])
+
     # -- Build maneuvers ----------
     maneuvers = [EvadeManeuver()]
 
@@ -1359,7 +1370,7 @@ if __name__ == "__main__":
         backup_mode="stop",
         T_M=0.7,
         delta=0.05,
-        backup_gain=np.array([40.0, 40.0]),
+        backup_gain=backup_gain,
     )
     policy.T = 1.5
     policy.debug = False
@@ -1373,23 +1384,26 @@ if __name__ == "__main__":
 
     # --- Robustness terms setup ---
 
-    # Choose which bound to use: "do" (disturbance observer) or "dr" (disturbance robust)
-    policy.robustness_terms.bound_type = "dr"
+    # # Choose which bound to use: "do" (disturbance observer) or "dr" (disturbance robust)
+    # policy.robustness_terms.bound_type = "dr"
 
-    # Constants from DR-bCBF / DO-bCBF setup
-    policy.robustness_terms.Lh_const = 1.0
-    policy.robustness_terms.Lhb_const = 1.0
-    policy.robustness_terms.L_cl = 0.2
-    policy.robustness_terms.dw_max = 0.05  # max disturbance bound
-    policy.robustness_terms.dv_max = 0.05  # observer error-rate bound (used by "do")
+    # # Constants from DR-bCBF / DO-bCBF setup
+    # policy.robustness_terms.Lh_const = 1.0
+    # policy.robustness_terms.Lhb_const = 1.0
+    # L_cl_1 = np.sqrt(1 + backup_gain[0]**2)
+    # L_cl_2 = np.sqrt((maneuver_gain[1]**2 + maneuver_gain[2]**2 + 1 + np.sqrt((maneuver_gain[1]**2 - maneuver_gain[2]**2 - 1)**2 + 4*maneuver_gain[1]**2*maneuver_gain[2]**2))/(2))
+    # policy.robustness_terms.L_cl = np.max([L_cl_1, L_cl_2])
+    # print("lipschitz: ", policy.robustness_terms.L_cl)
+    # policy.robustness_terms.dw_max = 0.05  # max disturbance bound
+    # policy.robustness_terms.dv_max = 0.05  # observer error-rate bound (used by "do")
 
-    # Prime epsilon terms for current tau_0 (usually 0 at start)
-    policy.epsilon_tau, policy.epsilon_backup = policy.robustness_terms.compute(
-        horizon=policy.T,
-        dt=policy.dt,
-        offset_time=policy.tau_0,
-    )
-    policy._robustness_initialized = True
+    # # Prime epsilon terms for current tau_0 (usually 0 at start)
+    # policy.epsilon_tau, policy.epsilon_backup = policy.robustness_terms.compute(
+    #     horizon=policy.T,
+    #     dt=policy.dt,
+    #     offset_time=policy.tau_0,
+    # )
+    # policy._robustness_initialized = True
 
     print(f"Policy: {policy.name}")
     print(f"Registered TBCs: {policy.tbcs}")
@@ -1430,7 +1444,7 @@ if __name__ == "__main__":
         # Disturbance
         dist = np.random.uniform(-1.0, 1.0, size=2)
         dist = np.concatenate([np.array([0.0, 0.0]), dist])
-        # dist = np.array([0.0, 0.0, 0.0, 0.0])
+        dist = np.array([0.0, 0.0, 0.0, 0.0])
 
         # Propagate robot state forward using the action
         x = np.array([robot.px, robot.py, robot.vx, robot.vy], dtype=float)
