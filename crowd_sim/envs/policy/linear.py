@@ -55,8 +55,8 @@ class LinearAcceleration(Policy):
         ay = (vy - self_state.vy) / self.time_step
 
         # # saturate the acceleration
-        # ax = np.clip(ax, -0.1, 0.1)
-        # ay = np.clip(ay, -0.1, 0.1)
+        ax = np.clip(ax, -15.0, 15.0)
+        ay = np.clip(ay, -15.0, 15.0)
 
         return ActionAcceleration(ax, ay)
 

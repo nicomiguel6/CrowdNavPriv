@@ -26,6 +26,9 @@ from numpy.linalg import norm
 from scipy.integrate import solve_ivp
 
 import matplotlib.pyplot as plt
+from matplotlib.collections import PatchCollection
+from matplotlib.lines import Line2D
+from matplotlib import patches
 
 from crowd_sim.envs.policy.policy import Policy
 from crowd_sim.envs.policy.linear import Linear, LinearAcceleration, GoStraight
@@ -137,7 +140,7 @@ class EvadeManeuver(BackupManeuver):
         # TODO: PD control to the desired position lane
         desired_maneuver = np.array(
             [
-                0.0,
+                2 * gains[2] * (-robot_state.vx),
                 gains[1] * (evade_position - robot_state.py)
                 + gains[2] * (-robot_state.vy),
             ]
@@ -151,7 +154,7 @@ class EvadeManeuver(BackupManeuver):
         # )  # constant acceleration in the y direction
 
         # Saturate the acceleration
-        # desired_maneuver = np.clip(desired_maneuver, -1.0, 1.0)
+        desired_maneuver = np.clip(desired_maneuver, -15.0, 15.0)
 
         return ActionAcceleration(desired_maneuver[0], desired_maneuver[1])
 
@@ -179,6 +182,9 @@ class BackupController:
             u_b = np.array(
                 [self.gain[0] * (-robot_state.vx), self.gain[1] * (-robot_state.vy)]
             )
+
+            u_b = np.clip(u_b, -15.0, 15.0)
+
         return ActionAcceleration(u_b[0], u_b[1])
 
         # if self.mode == "retreat" and len(human_states) > 0:
@@ -366,6 +372,7 @@ class TVBCBF(Policy):
         # Time-offset state  (Algorithm 1 / 2)
         self.delta_tau = 0.1
         self.system_time = 0.0
+        self.global_time = 0.0
         self.tau_0 = 0.0
         self.relative_time = 0.0
         self.system_times = []
@@ -387,16 +394,29 @@ class TVBCBF(Policy):
         self.backup_trajectories = (
             []
         )  # store projected flow following backup controller for each time step
+        self.backup_epsilon_taus = []  # epsilon_tau per stored backup traj (plotting)
+        self.backup_epsilon_plot_step = 10  # draw GW balls every N horizon steps
 
         # Store actions
         self.actions = []
 
         # Safety primitives
         self.safety = SafetyConstraints()
-        # self.robustness_terms = RobustnessTerms(self)
+        self.robustness_terms = RobustnessTerms(self)
         self.epsilon_tau = [0.0]
         self.epsilon_backup = 0.0
-        # self._robustness_initialized = False
+
+        # Single toggle for disturbance robustness (per-step observer + constraint
+        # tightening). Set to True to engage; leave False for the nominal filter.
+        self.robust = False
+
+        # Disturbance observer (mirrors planar_quadrotor/main_sim.py): tracks an
+        # auxiliary state and a disturbance estimate d_hat at every predict() step.
+        self.disturbance_gain = 10.0
+        self.d_hat_curr = np.zeros(4)
+        self.d_hats = []  # d_hat history for plotting / inspection
+        self._x_prev = None  # actual state at the previous step
+        self._u_prev = None  # action applied at the previous step
 
         # Engage backup fully (when on, this holds lambda at 0)
         self.full_backup = True
@@ -434,15 +454,20 @@ class TVBCBF(Policy):
             self.robustness_terms.L_cl = config.getfloat(
                 "tvbcbf", "L_cl", fallback=self.robustness_terms.L_cl
             )
-            self.robustness_terms.dw_max = config.getfloat(
-                "tvbcbf", "dw_max", fallback=self.robustness_terms.dw_max
+            self.robustness_terms.dd_max = config.getfloat(
+                "tvbcbf", "dd_max", fallback=self.robustness_terms.dd_max
             )
-            self.robustness_terms.dv_max = config.getfloat(
-                "tvbcbf", "dv_max", fallback=self.robustness_terms.dv_max
+            self.robustness_terms.omega = config.getfloat(
+                "tvbcbf", "omega", fallback=self.robustness_terms.omega
             )
             self.robustness_terms.bound_type = config.get(
                 "tvbcbf", "robustness_bound", fallback=self.robustness_terms.bound_type
             ).lower()
+            self.robust = config.getboolean("tvbcbf", "robust", fallback=self.robust)
+            self.disturbance_gain = config.getfloat(
+                "tvbcbf", "disturbance_gain", fallback=self.disturbance_gain
+            )
+            self.robustness_terms.disturbance_gain = self.disturbance_gain
 
         if config.has_section("action_space"):
             self.kinematics = config.get("action_space", "kinematics")
@@ -514,13 +539,22 @@ class TVBCBF(Policy):
         # 1) Desired action from nominal policy
         u_des = self._get_desired_action(state)
 
-        # Initialize robustness terms at the very beginning so the first
-        # time-offset feasibility check uses valid epsilons.
-        # if not self._robustness_initialized:
-        #     self.epsilon_tau, self.epsilon_backup = self.robustness_terms.compute(
-        #         horizon=self.T, dt=self.dt, offset_time=self.tau_0
-        #     )
-        #     self._robustness_initialized = True
+        if self.robust:
+            # Disturbance-observer update (mirrors planar_quadrotor/main_sim.py):
+            # estimate the disturbance from the mismatch between the measured
+            # state and an auxiliary state propagated under the previous estimate.
+            self._update_disturbance_observer(robot_state)
+
+            # With the observer, the error bound e_bar depends on global (system)
+            # time, so the tightening terms must be recomputed every step.
+            self.epsilon_tau, self.epsilon_backup = self.robustness_terms.compute(
+                horizon=self.T,
+                dt=self.dt,
+                offset_time=self.system_time,
+                global_time=self.global_time,
+            )
+        else:
+            self.epsilon_tau, self.epsilon_backup = [0.0], 0.0
 
         # 2) Update time-offset  (Algorithm 1)
         tau_0_prev = self.tau_0
@@ -528,7 +562,7 @@ class TVBCBF(Policy):
             self.compute_time_offset(
                 robot_state=robot_state,
                 human_states=human_states,
-                system_time=self.system_time,
+                global_time=self.global_time,
                 tau_0_prev=self.tau_0,
                 tbc=tbc,
                 dt=self.dt,
@@ -549,6 +583,7 @@ class TVBCBF(Policy):
         for bt in backup_trajectory:
             bt_array.append(np.array([bt.px, bt.py]))
         self.backup_trajectories.append(np.array(bt_array))  # store for plotting
+        self.backup_epsilon_taus.append(list(self.epsilon_tau) if self.robust else [])
 
         # We define self.system_time as the absolute time since the start of the simulation
         # We define self.tau_0 as the current offset-time value (Starts at 0.0)
@@ -591,7 +626,7 @@ class TVBCBF(Policy):
 
         # 5) Regulation function  (eq. 7-8)
         u_backup = tbc.evaluate(
-            self.system_time - self.tau_0, robot_state, human_states
+            self.global_time - self.tau_0, robot_state, human_states
         )
         u_act = self.regulation_function(u_des, u_backup, h_I)
 
@@ -601,7 +636,10 @@ class TVBCBF(Policy):
         if isinstance(tbc.maneuver, CarryOnManeuver):
             tbc.maneuver.latch_desired_action(u_des)
 
-        self.system_time += self.dt
+        # Remember this step's applied action for the next observer update.
+        self._u_prev = np.array([u_act.ax, u_act.ay], dtype=float)
+
+        self.global_time += self.dt
 
         if self.kinematics == "holonomic":
             return u_act
@@ -616,7 +654,7 @@ class TVBCBF(Policy):
         self,
         robot_state: FullState,
         human_states: List[ObservableState],
-        system_time: float,
+        global_time: float,
         tau_0_prev: float,
         tbc: TimeVaryingBackupController,
         dt: float,
@@ -652,16 +690,16 @@ class TVBCBF(Policy):
         # INPUT --------------------------------------------------------------
         # Get the candidate time offset
         if self.full_backup:
-            tau_0 = 0.0  # system_time  # - dt + self.delta_tau
+            tau_0 = 0.0  # global_time  # - dt + self.delta_tau
         else:
-            tau_0 = system_time
+            tau_0 = global_time
 
         # OUTPUT -------------------------------------------------------------
         # Propagate the system state forward using the TBC
         traj = self.simulate_flow(
             robot_state=robot_state,
             tbc=tbc,
-            system_time=system_time,
+            global_time=global_time,
             tau_0=tau_0,
             T=self.T,
             human_state=human_states[0],
@@ -695,7 +733,7 @@ class TVBCBF(Policy):
             new_traj = self.simulate_flow(
                 robot_state=robot_state,
                 tbc=tbc,
-                system_time=system_time,
+                global_time=global_time,
                 tau_0=tau_0,
                 T=self.T,
                 human_state=human_states[0],
@@ -849,9 +887,11 @@ class TVBCBF(Policy):
 
         # Step-wise feasibility: compare this step's minimum safety value
         # against this step's tightening epsilon.
-        for step_idx in range(num_steps-1):
-            # eps_tau = float(epsilon_tau[step_idx])
-            eps_tau = 0.0
+        for step_idx in range(num_steps - 1):
+            if self.robust and step_idx < len(epsilon_tau):
+                eps_tau = float(epsilon_tau[step_idx])
+            else:
+                eps_tau = 0.0
             if num_humans == 0:
                 step_min_h = np.inf
             else:
@@ -951,6 +991,39 @@ class TVBCBF(Policy):
         return sol.y[:, -1]
 
     # ------------------------------------------------------------------
+    # Disturbance observer
+    # ------------------------------------------------------------------
+
+    def _update_disturbance_observer(self, robot_state: FullState):
+        """
+        Update the disturbance estimate d_hat from the mismatch between the
+        measured state and an auxiliary state propagated under the previous
+        estimate, matching the per-step observer in
+        planar_quadrotor/main_sim.py:
+
+            xi    <- integrate(x_prev, u_prev, dt, d_hat)
+            d_hat <- K (x_now - xi)
+
+        with K = disturbance_gain * I.
+        """
+        x_now = np.array(
+            [robot_state.px, robot_state.py, robot_state.vx, robot_state.vy],
+            dtype=float,
+        )
+        if self._x_prev is not None and self._u_prev is not None:
+            xi = self.integrateState(
+                self._x_prev,
+                self._u_prev,
+                t_step=[0, self.dt],
+                dist=self.d_hat_curr,
+                options=self.int_options,
+            )
+            K = self.disturbance_gain * np.eye(len(x_now))
+            self.d_hat_curr = K @ (x_now - xi)
+        self._x_prev = x_now
+        self.d_hats.append(self.d_hat_curr.copy())
+
+    # ------------------------------------------------------------------
     # Flow simulation
     # ------------------------------------------------------------------
 
@@ -958,7 +1031,7 @@ class TVBCBF(Policy):
         self,
         robot_state: FullState,
         tbc: TimeVaryingBackupController,
-        system_time: float,
+        global_time: float,
         tau_0: float,
         T: float,
         human_state: Optional[ObservableState] = None,
@@ -992,14 +1065,20 @@ class TVBCBF(Policy):
             )
             # 1) calculate robot action
             # print(f"t - tau_0: {t - tau_0}")
-            action = tbc.evaluate(self.system_time + t*self.dt - tau_0, robot_state, human_states=None)
+            action = tbc.evaluate(
+                self.system_time + t * self.dt - tau_0, robot_state, human_states=None
+            )
+            # print(f"action: {action}")
 
-            # 2) propagate robot state forward using the action and nominal dynamics
+            # 2) propagate robot state forward using the action and nominal
+            # dynamics. When robust, follow the constant estimated disturbance
+            # d_hat (mirrors planar_quadrotor backup propagation with observer).
+            dist = self.d_hat_curr if self.robust else np.zeros(4)
             new_x = self.integrateState(
                 x,
                 action,
                 t_step=[0, self.dt],
-                dist=np.array([0.0, 0.0, 0.0, 0.0]),
+                dist=dist,
                 options=self.int_options,
             )
             x = new_x
@@ -1025,6 +1104,55 @@ class TVBCBF(Policy):
     # Debug plotting
     # ------------------------------------------------------------------
 
+    def _plot_epsilon_tau_circles(
+        self,
+        ax,
+        trajectory: List[FullState],
+        epsilon_tau: Sequence[float],
+        step: Optional[int] = None,
+    ) -> bool:
+        """
+        Overlay dashed circles at backup-horizon points with radius epsilon_tau[j],
+        every `step` indices (mirrors planar_quadrotor/plotting.py GW norm balls).
+        """
+        if not self.robust or len(trajectory) == 0 or len(epsilon_tau) == 0:
+            return False
+
+        e_tstep = self.backup_epsilon_plot_step if step is None else step
+        circ = []
+        n_eps = len(epsilon_tau)
+        for j in np.arange(0, len(trajectory), e_tstep):
+            ji = int(j)
+            if ji >= n_eps:
+                break
+            r_t = float(epsilon_tau[ji])
+            if r_t <= 0.0:
+                continue
+            s = trajectory[ji]
+            circ.append(
+                patches.Circle(
+                    (s.px, s.py),
+                    r_t,
+                    fill=False,
+                    linestyle="--",
+                    edgecolor="0.45",
+                )
+            )
+
+        if not circ:
+            return False
+
+        coll = PatchCollection(
+            circ,
+            facecolors="none",
+            edgecolors="0.45",
+            linewidths=1,
+            linestyles="--",
+            zorder=1,
+        )
+        ax.add_collection(coll)
+        return True
+
     def _plot_backup_horizon_axes(
         self,
         axes,
@@ -1049,7 +1177,22 @@ class TVBCBF(Policy):
                     (hs.px, hs.py), hs.radius, color="red", alpha=0.5, label="human"
                 )
             )
-        ax.legend(fontsize=7)
+        show_gw = self._plot_epsilon_tau_circles(ax, trajectory, self.epsilon_tau)
+        if show_gw:
+            handles, labels = ax.get_legend_handles_labels()
+            proxy = Line2D(
+                [0],
+                [0],
+                color="0.45",
+                lw=1,
+                linestyle="--",
+                label="GW Norm Ball",
+            )
+            handles.append(proxy)
+            labels.append("GW Norm Ball")
+            ax.legend(handles=handles, labels=labels, fontsize=7)
+        else:
+            ax.legend(fontsize=7)
         ax.set_xlabel("x (m)")
         ax.set_ylabel("y (m)")
         ax.set_title("Backup Trajectory (XY)")
@@ -1221,7 +1364,7 @@ class TVBCBF(Policy):
         u_act = lam * u_des_act + (1.0 - lam) * u_backup_act
 
         # Saturate the action
-        # u_act = np.clip(u_act, -1.0, 1.0)
+        u_act = np.clip(u_act, -15.0, 15.0)
 
         self.lambdas.append(lam)
 
@@ -1267,7 +1410,10 @@ class TVBCBF(Policy):
         self.tau_0 = 0.0
         self.system_time = 0.0
         self.active_tbc_index = 0
-        self._robustness_initialized = False
+        self.d_hat_curr = np.zeros(4)
+        self.d_hats = []
+        self._x_prev = None
+        self._u_prev = None
         for tbc in self.tbcs:
             if isinstance(tbc.maneuver, CarryOnManeuver):
                 tbc.maneuver.held_action = np.array([0.0, 0.0])
@@ -1283,38 +1429,65 @@ class RobustnessTerms:
         self.Lh_const = 1.0
         self.Lhb_const = 1.0
         self.L_cl = 1.0
-        self.dw_max = 0.0
-        self.dv_max = 0.0
+        # delta_d: bound on the disturbance. omega: disturbance frequency.
+        # The bound on the disturbance's rate of change is delta_v = delta_d * omega,
+        # exposed through the derived `dv_max` property below.
+        self.dd_max = 0.0
+        self.omega = 0.0
+        # Observer gain; must match the per-step disturbance observer gain so the
+        # global-time error bound e_bar is consistent with the running estimate.
+        self.disturbance_gain = 10.0
         self.bound_type = "do"
         self.epsilon_t = [0.0]
         self.epsilon_b = 0.0
 
+    @property
+    def dv_max(self) -> float:
+        """delta_v = delta_d * omega: bound on the disturbance's rate of change."""
+        return self.dd_max * self.omega
+
+    def _e_bar(self, t_global: float) -> float:
+        """
+        Disturbance-observer error bound at the current global time, mirroring
+        planar_quadrotor/safety.py::asif. As global time grows the bound decays
+        from dw_max toward dv_max / disturbance_gain.
+        """
+        if self.disturbance_gain <= 0.0:
+            return self.dd_max
+        decay = np.exp(-self.disturbance_gain * t_global)
+        return decay * self.dd_max + (self.dv_max / self.disturbance_gain) * (
+            1.0 - decay
+        )
+
     def _delta_t_dr(self, t: float) -> float:
-        if t <= 0.0 or self.dw_max <= 0.0:
+        if t <= 0.0 or self.dd_max <= 0.0:
             return 0.0
         if abs(self.L_cl) < 1e-9:
-            return self.dw_max * t
-        return (self.dw_max / self.L_cl) * (np.exp(self.L_cl * t) - 1.0)
+            return self.dd_max * t
+        return (self.dd_max / self.L_cl) * (np.exp(self.L_cl * t) - 1.0)
 
-    def _delta_t_do(self, t: float) -> float:
+    def _delta_t_do(self, t: float, e_bar: float) -> float:
         if t <= 0.0:
             return 0.0
         if abs(self.L_cl) < 1e-9:
-            return max(self.dw_max, self.dv_max) * t
-        e_bar = np.exp(-t) * self.dw_max + self.dv_max * (1.0 - np.exp(-t))
+            return max(e_bar, self.dd_max) * t
         term1 = ((self.dv_max / (self.L_cl**2)) + (e_bar / self.L_cl)) * (
             np.exp(self.L_cl * t) - 1.0
         )
         term2 = (self.dv_max / self.L_cl) * t
         return max(term1 - term2, 0.0)
 
-    def _delta_t(self, t: float) -> float:
+    def _delta_t(self, t: float, e_bar: float) -> float:
         if self.bound_type == "dr":
             return self._delta_t_dr(t)
-        return self._delta_t_do(t)
+        return self._delta_t_do(t, e_bar)
 
     def compute(
-        self, horizon: float, dt: float, offset_time: float = 0.0
+        self,
+        horizon: float,
+        dt: float,
+        offset_time: float = 0.0,
+        global_time: float = 0.0,
     ) -> Tuple[List[float], float]:
         if dt <= 0.0 or horizon <= 0.0:
             self.epsilon_t = [0.0]
@@ -1327,11 +1500,14 @@ class RobustnessTerms:
             self.epsilon_b = 0.0
             return self.epsilon_t, self.epsilon_b
 
+        # Observer error bound evaluated once at the current global time.
+        e_bar = self._e_bar(global_time)
+
         epsilons = [0.0 for _ in range(rta_points)]
         delta_terminal = 0.0
         for i in range(1, rta_points):
-            t = offset_time + dt * i
-            delta_t = self._delta_t(t)
+            t = dt * i
+            delta_t = self._delta_t(t, e_bar)
             epsilons[i] = self.Lh_const * delta_t
             delta_terminal = delta_t
 
@@ -1354,7 +1530,7 @@ class RobustnessTerms:
 if __name__ == "__main__":
     from crowd_sim.envs.utils.state import FullState, ObservableState, JointState
 
-    total_time = 30.0
+    total_time = 50.0
 
     backup_gain = np.array([10.0, 10.0])
     maneuver_gain = np.array([1.0, 20.0, 4.0])
@@ -1372,55 +1548,63 @@ if __name__ == "__main__":
         delta=0.05,
         backup_gain=backup_gain,
     )
-    policy.T = 1.5
+
+    policy.T = 0.8
     policy.debug = False
     policy.debug_backup_flow = False
     desired_frequency = 80.0  # 80.0 Hz
     policy.dt = 1.0 / desired_frequency
-    policy.beta = 100.0
+    policy.beta = 50.0
     policy.time_step = policy.dt
     policy.total_time = total_time
     policy.full_backup = False
 
     # --- Robustness terms setup ---
 
-    # # Choose which bound to use: "do" (disturbance observer) or "dr" (disturbance robust)
-    # policy.robustness_terms.bound_type = "dr"
+    # Single toggle: enable disturbance robustness (per-step observer + tightening).
+    policy.robust = True
 
-    # # Constants from DR-bCBF / DO-bCBF setup
-    # policy.robustness_terms.Lh_const = 1.0
-    # policy.robustness_terms.Lhb_const = 1.0
-    # L_cl_1 = np.sqrt(1 + backup_gain[0]**2)
-    # L_cl_2 = np.sqrt((maneuver_gain[1]**2 + maneuver_gain[2]**2 + 1 + np.sqrt((maneuver_gain[1]**2 - maneuver_gain[2]**2 - 1)**2 + 4*maneuver_gain[1]**2*maneuver_gain[2]**2))/(2))
-    # policy.robustness_terms.L_cl = np.max([L_cl_1, L_cl_2])
-    # print("lipschitz: ", policy.robustness_terms.L_cl)
-    # policy.robustness_terms.dw_max = 0.05  # max disturbance bound
-    # policy.robustness_terms.dv_max = 0.05  # observer error-rate bound (used by "do")
+    # Disturbance bound: "do" (disturbance observer, global-time e_bar) or
+    # "dr" (Gronwall disturbance-robust).
+    policy.robustness_terms.bound_type = "do"
 
-    # # Prime epsilon terms for current tau_0 (usually 0 at start)
-    # policy.epsilon_tau, policy.epsilon_backup = policy.robustness_terms.compute(
-    #     horizon=policy.T,
-    #     dt=policy.dt,
-    #     offset_time=policy.tau_0,
-    # )
-    # policy._robustness_initialized = True
+    # Safety / backup constraint Lipschitz constants.
+    policy.robustness_terms.Lh_const = 1.0
+    policy.robustness_terms.Lhb_const = 1.0
+    # Closed-loop Lipschitz (log-norm) constant L_cl. The backup phase and the
+    # maneuver phase each have their own bound from the eigenvalues of the
+    # corresponding closed-loop Jacobian; take the worst case.
+    L_cl_backup = 0.5 * (np.sqrt(1 + backup_gain[0] ** 2) - backup_gain[0])
+    L_cl_maneuver = 0.5 * (
+        -maneuver_gain[2] + np.sqrt(maneuver_gain[2] ** 2 + (1 - maneuver_gain[1]) ** 2)
+    )
+    policy.robustness_terms.L_cl = max(L_cl_backup, L_cl_maneuver)
+
+    # Disturbance bounds and observer gain (gain matches the per-step observer).
+    # delta_d (dw_max) bounds the disturbance; the coded disturbance below has
+    # magnitude 0.5. delta_v = delta_d * omega (the dv_max property) bounds its
+    # rate of change.
+    policy.robustness_terms.dd_max = 1.5  # delta_d: disturbance magnitude bound
+    policy.robustness_terms.omega = 0.5  # disturbance frequency
+    policy.disturbance_gain = 10.0
+    policy.robustness_terms.disturbance_gain = policy.disturbance_gain
 
     print(f"Policy: {policy.name}")
     print(f"Registered TBCs: {policy.tbcs}")
 
     # -- Fake a robot heading toward a goal with one human nearby ----------
     robot = FullState(
-        px=0.0,
+        px=-100.0,
         py=0.0,
-        vx=1.5,
+        vx=2.5,
         vy=0.0,
         radius=0.1,
-        gx=40.0,
+        gx=10.0,
         gy=0.0,
-        v_pref=1.5,
+        v_pref=2.5,
         theta=0.0,
     )
-    human = ObservableState(px=15.0, py=0.0, vx=0.0, vy=0.0, radius=0.1)
+    human = ObservableState(px=5.0, py=0.0, vx=0.0, vy=0.0, radius=0.1)
     state = JointState(robot, [human])
 
     # -- Nominal policy is a simple goal-seeking policy
@@ -1442,9 +1626,15 @@ if __name__ == "__main__":
         # Get the action from the policy
         action = policy.predict(state)
         # Disturbance
-        dist = np.random.uniform(-1.0, 1.0, size=2)
+        # dist = np.random.uniform(-1.0, 1.0, size=2)
+        dist = np.array(
+            [
+                np.sin(policy.robustness_terms.omega * t - np.pi / 4),
+                np.cos(policy.robustness_terms.omega * t - np.pi / 4),
+            ]
+        )
         dist = np.concatenate([np.array([0.0, 0.0]), dist])
-        dist = np.array([0.0, 0.0, 0.0, 0.0])
+        # dist = np.array([0.0, 0.0, 0.0, 0.0])
 
         # Propagate robot state forward using the action
         x = np.array([robot.px, robot.py, robot.vx, robot.vy], dtype=float)
@@ -1489,7 +1679,7 @@ if __name__ == "__main__":
     vxs = np.array([s.self_state.vx for s in trajectory])
     vys = np.array([s.self_state.vy for s in trajectory])
     ts = np.arange(len(trajectory)) * policy.time_step
-    backup_N = 20
+    backup_N = 10
 
     # --- Plot 1: XY trajectory ---
     fig1, ax1 = plt.subplots()
@@ -1501,14 +1691,49 @@ if __name__ == "__main__":
     for i in range(len(policy.backup_trajectories)):
         label = "Nominal Backup Trajectory" if i == 0 else None
         if i % backup_N == 0:
+            xy = policy.backup_trajectories[i]
             ax1.plot(
-                policy.backup_trajectories[i][:, 0],
-                policy.backup_trajectories[i][:, 1],
+                xy[:, 0],
+                xy[:, 1],
                 "k-.",
                 linewidth=1.0,
                 alpha=0.5,
                 label=label,
             )
+            if (
+                policy.robust
+                and i < len(policy.backup_epsilon_taus)
+                and policy.backup_epsilon_taus[i]
+            ):
+                eps = policy.backup_epsilon_taus[i]
+                circ = []
+                for j in np.arange(0, len(xy), policy.backup_epsilon_plot_step):
+                    ji = int(j)
+                    if ji >= len(eps):
+                        break
+                    r_t = float(eps[ji])
+                    if r_t <= 0.0:
+                        continue
+                    circ.append(
+                        patches.Circle(
+                            (xy[ji, 0], xy[ji, 1]),
+                            r_t,
+                            fill=False,
+                            linestyle="--",
+                            edgecolor="0.45",
+                        )
+                    )
+                if circ:
+                    ax1.add_collection(
+                        PatchCollection(
+                            circ,
+                            facecolors="none",
+                            edgecolors="0.45",
+                            linewidths=1,
+                            linestyles="--",
+                            zorder=1,
+                        )
+                    )
         # joint_state = trajectory[i]
         # robot_state = joint_state.self_state
         # if robot_state.px > 13.5 and robot_state.px < 15.45:
@@ -1533,7 +1758,22 @@ if __name__ == "__main__":
     ax1.set_xlabel("x (m)")
     ax1.set_ylabel("y (m)")
     ax1.set_title("XY Trajectory")
-    ax1.legend()
+    if policy.robust:
+        handles, labels = ax1.get_legend_handles_labels()
+        handles.append(
+            Line2D(
+                [0],
+                [0],
+                color="0.45",
+                lw=1,
+                linestyle="--",
+                label="GW Norm Ball",
+            )
+        )
+        labels.append("GW Norm Ball")
+        ax1.legend(handles=handles, labels=labels)
+    else:
+        ax1.legend()
     # ax1.set_aspect("equal")
     ax1.grid(True)
 
@@ -1542,14 +1782,28 @@ if __name__ == "__main__":
     # ---
     fig, axes = plt.subplots(1, 1, figsize=(14, 5))
 
-    # --- Plot 2: relative time vs system time ---
-    ax2 = axes
-    ax2.plot(ts[:-1], policy.relative_times, "b-", linewidth=1.5, label="Relative Time")
-    ax2.set_xlabel("Time (s)")
-    ax2.set_ylabel("Relative Time (s)")
-    ax2.set_title("Relative Time vs System Time")
-    ax2.legend()
-    ax2.grid(True)
+    # --- Plot 2: min_h_safe and h_backup vs system time (split into two subplots) ---
+    if hasattr(axes, "__len__"):
+        ax_h_safe = axes[0]
+        ax_h_backup = axes[1]
+    else:
+        fig, (ax_h_safe, ax_h_backup) = plt.subplots(1, 2, figsize=(10, 4))
+
+    # Plot min_h_safe vs time
+    ax_h_safe.plot(ts[:-1], policy.h_safe_mins, "b-", linewidth=1.5, label="min_h_safe")
+    ax_h_safe.set_xlabel("Time (s)")
+    ax_h_safe.set_ylabel("CBF Value")
+    ax_h_safe.set_title("min_h_safe vs System Time")
+    ax_h_safe.legend()
+    ax_h_safe.grid(True)
+
+    # Plot h_backup vs time
+    ax_h_backup.plot(ts[:-1], policy.h_backups, "r-", linewidth=1.5, label="h_backup")
+    ax_h_backup.set_xlabel("Time (s)")
+    ax_h_backup.set_ylabel("CBF Value")
+    ax_h_backup.set_title("h_backup vs System Time")
+    ax_h_backup.legend()
+    ax_h_backup.grid(True)
 
     # # --- Plot 3: position vs time ---
     # ax3 = axes
