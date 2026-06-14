@@ -395,7 +395,7 @@ class TVBCBF(Policy):
             []
         )  # store projected flow following backup controller for each time step
         self.backup_epsilon_taus = []  # epsilon_tau per stored backup traj (plotting)
-        self.backup_epsilon_plot_step = 10  # draw GW balls every N horizon steps
+        self.backup_epsilon_plot_step = 100  # draw GW balls every N horizon steps
 
         # Store actions
         self.actions = []
@@ -1530,7 +1530,7 @@ class RobustnessTerms:
 if __name__ == "__main__":
     from crowd_sim.envs.utils.state import FullState, ObservableState, JointState
 
-    total_time = 50.0
+    total_time = 10.0
 
     backup_gain = np.array([10.0, 10.0])
     maneuver_gain = np.array([1.0, 20.0, 4.0])
@@ -1584,7 +1584,7 @@ if __name__ == "__main__":
     # delta_d (dw_max) bounds the disturbance; the coded disturbance below has
     # magnitude 0.5. delta_v = delta_d * omega (the dv_max property) bounds its
     # rate of change.
-    policy.robustness_terms.dd_max = 1.5  # delta_d: disturbance magnitude bound
+    policy.robustness_terms.dd_max = 1  # delta_d: disturbance magnitude bound
     policy.robustness_terms.omega = 0.5  # disturbance frequency
     policy.disturbance_gain = 10.0
     policy.robustness_terms.disturbance_gain = policy.disturbance_gain
@@ -1594,7 +1594,7 @@ if __name__ == "__main__":
 
     # -- Fake a robot heading toward a goal with one human nearby ----------
     robot = FullState(
-        px=-100.0,
+        px=0.0,
         py=0.0,
         vx=2.5,
         vy=0.0,
@@ -1679,7 +1679,7 @@ if __name__ == "__main__":
     vxs = np.array([s.self_state.vx for s in trajectory])
     vys = np.array([s.self_state.vy for s in trajectory])
     ts = np.arange(len(trajectory)) * policy.time_step
-    backup_N = 10
+    backup_N = 100
 
     # --- Plot 1: XY trajectory ---
     fig1, ax1 = plt.subplots()
